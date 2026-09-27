@@ -1,389 +1,642 @@
 <!DOCTYPE html>
 <html lang="ja">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-    <title>YUBISHO - Phase 1 Engine v2</title>
-    <style>
-        * {
-            box-sizing: border-box;
-            margin: 0;
-            padding: 0;
-            user-select: none;
-            -webkit-user-select: none;
-            touch-action: none;
-        }
-        body, html {
-            width: 100%;
-            height: 100%;
-            overflow: hidden;
-            background-color: #f3efe6;
-            font-family: -apple-system, BlinkMacSystemFont, sans-serif;
-        }
-        #canvas-container {
-            width: 100%;
-            height: 100%;
-            position: relative;
-        }
-        canvas {
-            display: block;
-            width: 100%;
-            height: 100%;
-        }
-        #debug-overlay {
-            position: absolute;
-            top: 10px;
-            left: 10px;
-            background: rgba(0, 0, 0, 0.8);
-            color: #00ff66;
-            font-family: monospace;
-            font-size: 11px;
-            padding: 10px;
-            border-radius: 4px;
-            pointer-events: none;
-            display: none;
-            z-index: 100;
-            line-height: 1.4;
-        }
-        #secret-trigger {
-            position: absolute;
-            top: 0;
-            right: 0;
-            width: 80px;
-            height: 80px;
-            z-index: 1000;
-        }
-    </style>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<title>YUBISHO</title>
+<style>
+  html, body {
+    margin: 0; padding: 0;
+    width: 100%; height: 100%;
+    overflow: hidden;
+    background: #1a1a1a;
+    touch-action: none;
+    -webkit-user-select: none; user-select: none;
+    -webkit-touch-callout: none;
+  }
+  #stage { position: absolute; top: 0; left: 0; width: 100%; height: 100%; }
+  canvas { position: absolute; top: 0; left: 0; touch-action: none; }
+  #ink { mix-blend-mode: multiply; }
+  #hint {
+    position: absolute; top: 50%; left: 50%;
+    transform: translate(-50%, -50%);
+    color: rgba(70, 58, 46, 0.38);
+    font-family: -apple-system, "Hiragino Sans", sans-serif;
+    font-size: 16px; letter-spacing: 4px;
+    pointer-events: none;
+    transition: opacity 1.2s ease;
+    white-space: nowrap;
+  }
+  #hint.hidden { opacity: 0; }
+  #debug {
+    position: absolute; top: 6px; left: 6px;
+    color: #7CFC7C; font: 10px/1.4 monospace;
+    background: rgba(0,0,0,0.55); padding: 6px 8px;
+    white-space: pre; pointer-events: none;
+    display: none; z-index: 10;
+  }
+</style>
 </head>
 <body>
-
-<div id="canvas-container">
-    <canvas id="yubisho-canvas"></canvas>
-    <div id="debug-overlay">
-        FPS: <span id="db-fps">0</span><br>
-        Speed: <span id="db-speed">0.00</span><br>
-        Ink: <span id="db-ink">0.00</span><br>
-        Dryness: <span id="db-dry">0.00</span>
-    </div>
-    <div id="secret-trigger"></div>
+<div id="stage">
+  <canvas id="paper"></canvas>
+  <canvas id="ink"></canvas>
 </div>
+<div id="hint">指で触れてください</div>
+<div id="debug"></div>
 
 <script>
-const Config = {
-    DEBUG: false,
-    BASE_RADIUS: 16,
-    MAX_RADIUS_BONUS: 24,
-    INK_CONSUMPTION: 0.003,
-    INK_RECOVERY: 0.05
+(function () {
+'use strict';
+
+// =========================================================
+// 0. DEBUG SWITCH
+// =========================================================
+const DEBUG = false;
+
+// =========================================================
+// 1. CONFIG — all tunable parameters live here
+// =========================================================
+const CONFIG = {
+  paper: {
+    baseColor: [237, 229, 210],   // washi base (RGB)
+    unevenness: 0.05,             // large-scale light/dark mura
+    fiberDensity: 900,            // number of fiber strokes drawn
+    fiberAlpha: 0.035,
+    noiseAlpha: 0.02
+  },
+  contact: {
+    minRadius: 2.6,
+    maxRadius: 15,
+    smoothing: 0.30,              // low-pass filter factor (0-1, higher = snappier)
+    fallbackRadius: 6.5,          // used when width/height unavailable (mouse)
+    fallbackJitter: 1.2
+  },
+  ink: {
+    startAmount: 1.0,
+    maxAmount: 1.0,
+    minAmount: 0.04,
+    consumptionPerPixel: 0.0016,      // base ink used per px moved
+    consumptionSpeedGain: 0.0030,     // extra consumption scaling with speed
+    replenishRate: 0.00065,           // per ms, active only at low speed
+    replenishSpeedCeiling: 0.25,      // speed (px/ms) below which replenish happens
+    idleBleedRate: 0.00045,           // per ms while nearly stationary
+    idleBleedMax: 0.9,
+    idleSpeedThreshold: 0.02
+  },
+  render: {
+    stampSpacing: 1.6,            // draw a stamp every N px of travel (min)
+    centerAlpha: 0.80,            // base alpha at stamp center (before ink/opacity scaling)
+    shapeWobble: 0.18,            // 0-1, irregularity of stamp silhouette
+    positionJitter: 0.35,         // px, tiny randomness in stamp placement
+    speedWidthFactor: 0.38,       // how much high speed narrows the radius
+    bleedRadiusFactor: 1.35,      // how much larger the soft bleed halo is vs core
+    bleedAlphaFactor: 0.22,
+    kasureInkThreshold: 0.32,     // below this ink amount, dryness can appear
+    kasureSpeedThreshold: 0.30,   // above this speed, dryness can appear
+    kasureMaxProb: 0.55,
+    startTaperPoints: 7,          // number of samples over which stroke ramps up
+    endTaperSteps: 7,             // number of samples used to fade the stroke out
+    inkColorBase: [22, 20, 24],   // near-black with faint cool tint
+    inkColorJitter: 6             // +/- per-channel jitter
+  }
 };
 
-// 簡易ノイズ生成
-function pseudoNoise(x, y) {
-    const n = Math.sin(x * 12.9898 + y * 78.233) * 43758.5453;
-    return n - Math.floor(n);
-}
-
+// =========================================================
+// 2. Paper — static washi background
+// =========================================================
 class Paper {
-    constructor(canvas) {
-        this.canvas = canvas;
-        this.ctx = canvas.getContext('2d');
-        this.textureCanvas = document.createElement('canvas');
-        this.fiberMaskCanvas = document.createElement('canvas');
+  constructor(canvas) {
+    this.canvas = canvas;
+    this.ctx = canvas.getContext('2d');
+  }
+
+  resize(w, h, dpr) {
+    this.canvas.width = Math.round(w * dpr);
+    this.canvas.height = Math.round(h * dpr);
+    this.canvas.style.width = w + 'px';
+    this.canvas.style.height = h + 'px';
+    this.w = w; this.h = h; this.dpr = dpr;
+    this._render();
+  }
+
+  _render() {
+    const ctx = this.ctx;
+    const { w, h, dpr } = this;
+    ctx.save();
+    ctx.scale(dpr, dpr);
+
+    const [r, g, b] = CONFIG.paper.baseColor;
+    ctx.fillStyle = `rgb(${r},${g},${b})`;
+    ctx.fillRect(0, 0, w, h);
+
+    // large-scale unevenness (a few soft blotches of light/dark)
+    const blotchCount = 10;
+    for (let i = 0; i < blotchCount; i++) {
+      const x = Math.random() * w;
+      const y = Math.random() * h;
+      const radius = 80 + Math.random() * 220;
+      const delta = (Math.random() - 0.5) * 2 * CONFIG.paper.unevenness * 255;
+      const grad = ctx.createRadialGradient(x, y, 0, x, y, radius);
+      const c = Math.max(0, Math.min(255, r + delta));
+      grad.addColorStop(0, `rgba(${c},${c * (g / r)},${c * (b / r)},0.06)`);
+      grad.addColorStop(1, 'rgba(0,0,0,0)');
+      ctx.fillStyle = grad;
+      ctx.fillRect(0, 0, w, h);
     }
 
-    resize(w, h) {
-        this.canvas.width = w;
-        this.canvas.height = h;
-        this.textureCanvas.width = w;
-        this.textureCanvas.height = h;
-        this.fiberMaskCanvas.width = w;
-        this.fiberMaskCanvas.height = h;
-        this.generateTexture(w, h);
+    // fine fiber texture
+    ctx.strokeStyle = `rgba(60,50,40,${CONFIG.paper.fiberAlpha})`;
+    ctx.lineWidth = 0.6;
+    for (let i = 0; i < CONFIG.paper.fiberDensity; i++) {
+      const x = Math.random() * w;
+      const y = Math.random() * h;
+      const len = 3 + Math.random() * 9;
+      const angle = Math.random() * Math.PI * 2;
+      ctx.beginPath();
+      ctx.moveTo(x, y);
+      ctx.lineTo(x + Math.cos(angle) * len, y + Math.sin(angle) * len);
+      ctx.stroke();
     }
 
-    generateTexture(w, h) {
-        const tCtx = this.textureCanvas.getContext('2d');
-        const mCtx = this.fiberMaskCanvas.getContext('2d');
-
-        // ベース和紙色
-        tCtx.fillStyle = '#f3efe6';
-        tCtx.fillRect(0, 0, w, h);
-
-        // 紙の繊維ノイズ
-        const imgData = tCtx.getImageData(0, 0, w, h);
-        const data = imgData.data;
-        for (let i = 0; i < data.length; i += 4) {
-            const n = (Math.random() - 0.5) * 14;
-            data[i]     = Math.min(255, Math.max(0, data[i] + n));
-            data[i + 1] = Math.min(255, Math.max(0, data[i + 1] + n));
-            data[i + 2] = Math.min(255, Math.max(0, data[i + 2] + n));
-        }
-        tCtx.putImageData(imgData, 0, 0);
-
-        // 掠れ打ち抜き用の高コントラスト繊維マスクの生成
-        mCtx.fillStyle = '#000';
-        mCtx.fillRect(0, 0, w, h);
-        mCtx.fillStyle = '#fff';
-        
-        for (let i = 0; i < w; i += 3) {
-            for (let j = 0; j < h; j += 3) {
-                if (pseudoNoise(i * 0.1, j * 0.1) > 0.62) {
-                    mCtx.fillRect(i, j, 2, 2);
-                }
-            }
-        }
-
-        this.render();
+    // fine grain noise (sparse dots, cheap)
+    ctx.fillStyle = `rgba(40,35,28,${CONFIG.paper.noiseAlpha})`;
+    const dotCount = Math.floor((w * h) / 900);
+    for (let i = 0; i < dotCount; i++) {
+      const x = Math.random() * w;
+      const y = Math.random() * h;
+      ctx.fillRect(x, y, 1, 1);
     }
 
-    render() {
-        this.ctx.drawImage(this.textureCanvas, 0, 0);
-    }
+    ctx.restore();
+  }
 }
 
+// =========================================================
+// 3. TouchInput — raw pointer capture (single-touch only)
+// =========================================================
+class TouchInput {
+  constructor(el, callbacks) {
+    this.el = el;
+    this.cb = callbacks;
+    this.activePointerId = null;
+
+    el.addEventListener('pointerdown', this._onDown.bind(this), { passive: false });
+    el.addEventListener('pointermove', this._onMove.bind(this), { passive: false });
+    el.addEventListener('pointerup', this._onUp.bind(this), { passive: false });
+    el.addEventListener('pointercancel', this._onUp.bind(this), { passive: false });
+    el.addEventListener('pointerleave', this._onLeaveMaybe.bind(this), { passive: false });
+    el.addEventListener('contextmenu', (e) => e.preventDefault());
+    document.addEventListener('gesturestart', (e) => e.preventDefault());
+  }
+
+  _extract(e) {
+    return {
+      x: e.clientX,
+      y: e.clientY,
+      t: e.timeStamp,
+      width: e.width || 0,
+      height: e.height || 0,
+      pressure: e.pressure || 0
+    };
+  }
+
+  _onDown(e) {
+    if (this.activePointerId !== null) return; // ignore multi-touch
+    this.activePointerId = e.pointerId;
+    e.preventDefault();
+    this.cb.onStart(this._extract(e));
+  }
+
+  _onMove(e) {
+    if (e.pointerId !== this.activePointerId) return;
+    e.preventDefault();
+    this.cb.onMove(this._extract(e));
+  }
+
+  _onUp(e) {
+    if (e.pointerId !== this.activePointerId) return;
+    e.preventDefault();
+    this.activePointerId = null;
+    this.cb.onEnd(this._extract(e));
+  }
+
+  _onLeaveMaybe(e) {
+    // treat leaving the surface while pressed as an end, to avoid stuck strokes
+    if (e.pointerId !== this.activePointerId) return;
+    this._onUp(e);
+  }
+}
+
+// =========================================================
+// 4. MotionAnalyzer — derives velocity / acceleration / direction / contactRadius
+// =========================================================
 class MotionAnalyzer {
-    constructor() {
-        this.last = null;
+  constructor(config) {
+    this.cfg = config;
+    this.reset();
+  }
+
+  reset() {
+    this.prev = null;
+    this.smoothRadius = null;
+    this.smoothSpeed = 0;
+  }
+
+  update(sample) {
+    const cfg = this.cfg;
+    let vx = 0, vy = 0, speed = 0, acceleration = 0, direction = 0, dt = 16, dist = 0;
+
+    // contact radius from width/height, or fallback
+    let rawRadius;
+    if (sample.width > 0 || sample.height > 0) {
+      const avg = ((sample.width || sample.height) + (sample.height || sample.width)) / 2;
+      rawRadius = mapRange(avg, 4, 40, cfg.minRadius, cfg.maxRadius);
+    } else {
+      rawRadius = cfg.fallbackRadius + (Math.random() - 0.5) * cfg.fallbackJitter;
+    }
+    rawRadius = clamp(rawRadius, cfg.minRadius, cfg.maxRadius);
+    this.smoothRadius = (this.smoothRadius === null)
+      ? rawRadius
+      : lerp(this.smoothRadius, rawRadius, cfg.smoothing);
+
+    if (this.prev) {
+      dt = Math.max(1, sample.t - this.prev.t);
+      const dx = sample.x - this.prev.x;
+      const dy = sample.y - this.prev.y;
+      dist = Math.hypot(dx, dy);
+      vx = dx / dt;
+      vy = dy / dt;
+      speed = Math.hypot(vx, vy); // px/ms
+      acceleration = (speed - this.smoothSpeed) / dt;
+      direction = Math.atan2(dy, dx);
+      this.smoothSpeed = lerp(this.smoothSpeed, speed, 0.4);
     }
 
-    reset() { this.last = null; }
+    this.prev = sample;
 
-    analyze(sample) {
-        if (!this.last || sample.phase === 'start') {
-            this.last = { ...sample, speed: 0, dir: 0, r: sample.radius };
-            return { ...sample, speed: 0, dir: 0, r: sample.radius };
-        }
-
-        const dt = Math.max(1, sample.time - this.last.time);
-        const dx = sample.x - this.last.x;
-        const dy = sample.y - this.last.y;
-        const dist = Math.hypot(dx, dy);
-        const speed = dist / dt;
-        const dir = Math.atan2(dy, dx);
-        
-        const r = Math.min(Config.BASE_RADIUS + Config.MAX_RADIUS_BONUS, 
-                   Math.max(6, sample.radius));
-
-        const res = { ...sample, speed, dir, r, dx, dy, dist };
-        this.last = res;
-        return res;
-    }
+    return {
+      x: sample.x, y: sample.y, t: sample.t,
+      vx, vy, speed, acceleration, direction,
+      dist, dt,
+      radius: this.smoothRadius
+    };
+  }
 }
 
-class InkEngine {
-    constructor(ctx, paper) {
-        this.ctx = ctx;
-        this.paper = paper;
-        this.ink = 1.0;
-        this.lastPt = null;
+// =========================================================
+// 5. InkModel — internal ink amount / bleed state for one stroke
+// =========================================================
+class InkModel {
+  constructor(config) {
+    this.cfg = config;
+  }
+
+  startStroke() {
+    this.inkAmount = this.cfg.startAmount;
+    this.idleBleed = 0;
+  }
+
+  update(motion) {
+    const cfg = this.cfg;
+    const speed = motion.speed || 0;
+    const dist = motion.dist || 0;
+    const dt = motion.dt || 16;
+
+    // consumption from movement
+    const consumption = dist * (cfg.consumptionPerPixel + speed * cfg.consumptionSpeedGain);
+    this.inkAmount -= consumption;
+
+    // slow replenishment while moving gently
+    if (speed < cfg.replenishSpeedCeiling) {
+      this.inkAmount += cfg.replenishRate * dt;
+    }
+    this.inkAmount = clamp(this.inkAmount, cfg.minAmount, cfg.maxAmount);
+
+    // idle bleed accumulator (near-stationary contact)
+    if (speed < cfg.idleSpeedThreshold) {
+      this.idleBleed = Math.min(cfg.idleBleedMax, this.idleBleed + cfg.idleBleedRate * dt);
+    } else {
+      this.idleBleed = Math.max(0, this.idleBleed - cfg.idleBleedRate * dt * 2);
     }
 
-    reset() {
-        this.ink = 1.0;
-        this.lastPt = null;
-    }
-
-    draw(m) {
-        // 墨量の計算
-        if (m.phase === 'start') {
-            this.ink = 1.0;
-        } else if (m.speed < 0.05) {
-            this.ink = Math.min(1.0, this.ink + Config.INK_RECOVERY);
-        } else {
-            this.ink = Math.max(0.05, this.ink - m.speed * Config.INK_CONSUMPTION);
-        }
-
-        const dryness = Math.min(0.95, Math.max(0, (m.speed * 0.4) - (this.ink * 0.7)));
-        const density = Math.max(0.15, this.ink * (1.1 - Math.min(0.7, m.speed * 0.2)));
-
-        if (m.phase === 'start' || !this.lastPt) {
-            this.lastPt = { x: m.x, y: m.y, r: m.r * 0.4, dir: m.dir };
-            return { ink: this.ink, dryness };
-        }
-
-        // 収筆（抜け）の処理
-        let targetX = m.x;
-        let targetY = m.y;
-        let targetR = m.r;
-
-        if (m.phase === 'end') {
-            const exitDist = Math.min(25, m.speed * 12);
-            targetX += Math.cos(m.dir) * exitDist;
-            targetY += Math.sin(m.dir) * exitDist;
-            targetR = 1.0; // 先端を研ぎ澄ます
-        }
-
-        // 補間ステップ描画（リボン接続）
-        const dx = targetX - this.lastPt.x;
-        const dy = targetY - this.lastPt.y;
-        const dist = Math.hypot(dx, dy);
-        const steps = Math.max(1, Math.ceil(dist / 2));
-
-        for (let i = 0; i < steps; i++) {
-            const t = i / steps;
-            const cx = this.lastPt.x + dx * t;
-            const cy = this.lastPt.y + dy * t;
-            const cr = this.lastPt.r + (targetR - this.lastPt.r) * t;
-            const angle = m.dir + Math.PI / 2; // 接線方向
-
-            this.renderBrushSegment(cx, cy, cr, angle, density, dryness);
-        }
-
-        this.lastPt = { x: targetX, y: targetY, r: targetR, dir: m.dir };
-        return { ink: this.ink, dryness };
-    }
-
-    renderBrushSegment(x, y, r, angle, density, dryness) {
-        const ctx = this.ctx;
-        ctx.save();
-
-        // 1. 滲み（外周の非常に薄い拡散）
-        if (dryness < 0.3) {
-            ctx.fillStyle = `rgba(15, 15, 15, ${density * 0.08})`;
-            ctx.beginPath();
-            ctx.arc(x + (Math.random() - 0.5) * 2, y + (Math.random() - 0.5) * 2, r * 1.35, 0, Math.PI * 2);
-            ctx.fill();
-        }
-
-        // 2. 墨核（非円形・不規則ポリゴン）
-        const cos = Math.cos(angle);
-        const sin = Math.sin(angle);
-
-        // 筆の穂先（線片）の両端座標を求める
-        const p1x = x + cos * r * (1 + (Math.random() - 0.5) * 0.3);
-        const p1y = y + sin * r * (1 + (Math.random() - 0.5) * 0.3);
-        const p2x = x - cos * r * (1 + (Math.random() - 0.5) * 0.3);
-        const p2y = y - sin * r * (1 + (Math.random() - 0.5) * 0.3);
-
-        ctx.fillStyle = `rgba(12, 12, 14, ${density})`;
-        ctx.beginPath();
-        ctx.moveTo(p1x, p1y);
-        ctx.lineTo(p2x, p2y);
-        ctx.lineTo(p2x + (Math.random() - 0.5) * 4, p2y + (Math.random() - 0.5) * 4);
-        ctx.lineTo(p1x + (Math.random() - 0.5) * 4, p1y + (Math.random() - 0.5) * 4);
-        ctx.closePath();
-        ctx.fill();
-
-        // 3. 掠れ（紙繊維マスクによるリアル打ち抜き）
-        if (dryness > 0.15) {
-            ctx.globalCompositeOperation = 'destination-out';
-            const cutAlpha = Math.min(0.85, (dryness - 0.15) * 1.4);
-            ctx.fillStyle = `rgba(0, 0, 0, ${cutAlpha})`;
-
-            // 繊維パターンに基いて削る
-            const maskSize = r * 2.2;
-            ctx.drawImage(
-                this.paper.fiberMaskCanvas,
-                Math.max(0, x - maskSize / 2), Math.max(0, y - maskSize / 2), maskSize, maskSize,
-                x - maskSize / 2, y - maskSize / 2, maskSize, maskSize
-            );
-        }
-
-        ctx.restore();
-    }
+    return { inkAmount: this.inkAmount, bleed: this.idleBleed };
+  }
 }
 
+// =========================================================
+// 6. StrokeRenderer — turns motion+ink samples into ink stamps on canvas
+// =========================================================
+class StrokeRenderer {
+  constructor(ctx) {
+    this.ctx = ctx;
+  }
+
+  stamp(x, y, radius, inkAmount, bleed, speed) {
+    const ctx = this.ctx;
+    const cfg = CONFIG.render;
+
+    // dryness (kasure): probabilistically skip / weaken the stamp
+    let dryGap = 0;
+    if (inkAmount < cfg.kasureInkThreshold && speed > cfg.kasureSpeedThreshold) {
+      const inkFactor = clamp((cfg.kasureInkThreshold - inkAmount) / cfg.kasureInkThreshold, 0, 1);
+      const speedFactor = clamp((speed - cfg.kasureSpeedThreshold) / (cfg.kasureSpeedThreshold * 1.5), 0, 1);
+      dryGap = inkFactor * speedFactor * cfg.kasureMaxProb;
+      if (Math.random() < dryGap) return { drawn: false, dryGap };
+    }
+
+    // speed narrows the perceived radius slightly
+    const speedNarrow = 1 - clamp(speed * cfg.speedWidthFactor, 0, 0.45);
+    const r = Math.max(0.6, radius * speedNarrow * (0.55 + inkAmount * 0.6));
+
+    const jx = x + (Math.random() - 0.5) * cfg.positionJitter;
+    const jy = y + (Math.random() - 0.5) * cfg.positionJitter;
+
+    const [br, bg, bb] = CONFIG.render.inkColorBase;
+    const jitter = CONFIG.render.inkColorJitter;
+    const cr = clamp(br + (Math.random() - 0.5) * jitter, 0, 255);
+    const cg = clamp(bg + (Math.random() - 0.5) * jitter, 0, 255);
+    const cb = clamp(bb + (Math.random() - 0.5) * jitter, 0, 255);
+
+    const centerAlpha = cfg.centerAlpha * (0.5 + inkAmount * 0.5);
+
+    // soft bleed halo first (if idle bleeding is present)
+    if (bleed > 0.02) {
+      const bleedR = r * cfg.bleedRadiusFactor * (1 + bleed);
+      const g2 = ctx.createRadialGradient(jx, jy, 0, jx, jy, bleedR);
+      g2.addColorStop(0, `rgba(${cr},${cg},${cb},${centerAlpha * cfg.bleedAlphaFactor * bleed})`);
+      g2.addColorStop(1, `rgba(${cr},${cg},${cb},0)`);
+      ctx.fillStyle = g2;
+      ctx.beginPath();
+      ctx.arc(jx, jy, bleedR, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    // main stamp: irregular blob via wobbled radius per angle
+    const wobble = cfg.shapeWobble;
+    const points = 10;
+    ctx.save();
+    ctx.beginPath();
+    for (let i = 0; i <= points; i++) {
+      const a = (i / points) * Math.PI * 2;
+      const rr = r * (1 - wobble / 2 + Math.random() * wobble);
+      const px = jx + Math.cos(a) * rr;
+      const py = jy + Math.sin(a) * rr;
+      if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+    }
+    ctx.closePath();
+
+    const grad = ctx.createRadialGradient(jx, jy, 0, jx, jy, r);
+    grad.addColorStop(0, `rgba(${cr},${cg},${cb},${centerAlpha})`);
+    grad.addColorStop(0.6, `rgba(${cr},${cg},${cb},${centerAlpha * 0.55})`);
+    grad.addColorStop(1, `rgba(${cr},${cg},${cb},0)`);
+    ctx.fillStyle = grad;
+    ctx.fill();
+    ctx.restore();
+
+    return { drawn: true, dryGap, radius: r, opacity: centerAlpha };
+  }
+
+  clear(w, h) {
+    this.ctx.clearRect(0, 0, w, h);
+  }
+}
+
+// =========================================================
+// 7. StrokeRecorder — records normalized motion data, separate from pixels
+// =========================================================
+class StrokeRecorder {
+  constructor() {
+    this.strokes = [];
+    this.current = null;
+  }
+
+  startStroke() {
+    this.current = { points: [] };
+  }
+
+  addPoint(motion, w, h) {
+    if (!this.current) return;
+    this.current.points.push({
+      x: motion.x / w,
+      y: motion.y / h,
+      t: motion.t,
+      vx: motion.vx,
+      vy: motion.vy,
+      speed: motion.speed,
+      acceleration: motion.acceleration,
+      radius: motion.radius / Math.max(w, h),
+      direction: motion.direction
+    });
+  }
+
+  endStroke() {
+    if (this.current && this.current.points.length > 0) {
+      this.strokes.push(this.current);
+    }
+    this.current = null;
+  }
+
+  getData() {
+    return {
+      version: 1,
+      coordinateSystem: 'normalized',
+      strokes: this.strokes
+    };
+  }
+
+  clear() {
+    this.strokes = [];
+    this.current = null;
+  }
+}
+
+// =========================================================
+// 8. App — wiring everything together
+// =========================================================
 class App {
-    constructor() {
-        this.canvas = document.getElementById('yubisho-canvas');
-        this.paper = new Paper(this.canvas);
-        this.analyzer = new MotionAnalyzer();
-        this.engine = new InkEngine(this.paper.ctx, this.paper);
+  constructor() {
+    this.paperCanvas = document.getElementById('paper');
+    this.inkCanvas = document.getElementById('ink');
+    this.hintEl = document.getElementById('hint');
+    this.debugEl = document.getElementById('debug');
 
-        this.init();
+    this.paper = new Paper(this.paperCanvas);
+    this.inkCtx = this.inkCanvas.getContext('2d');
+    this.renderer = new StrokeRenderer(this.inkCtx);
+    this.motion = new MotionAnalyzer(CONFIG.contact);
+    this.ink = new InkModel(CONFIG.ink);
+    this.recorder = new StrokeRecorder();
+
+    this.strokeHistory = [];   // completed StrokeData+meta, kept for future Undo
+    this.strokeSampleCount = 0;
+    this.hintDismissed = false;
+    this.lastTapTime = 0;
+    this.fps = 0;
+    this._lastFrameT = performance.now();
+
+    this._resize();
+    window.addEventListener('resize', () => this._resize());
+
+    this.input = new TouchInput(this.inkCanvas, {
+      onStart: (s) => this._onStart(s),
+      onMove: (s) => this._onMove(s),
+      onEnd: (s) => this._onEnd(s)
+    });
+
+    if (DEBUG) {
+      this.debugEl.style.display = 'block';
+      requestAnimationFrame(this._debugLoop.bind(this));
     }
 
-    init() {
-        this.resize();
-        window.addEventListener('resize', () => this.resize());
+    // dev-only clear: double tap within bottom-right 80x80 zone
+    this.inkCanvas.addEventListener('pointerdown', (e) => this._maybeDevClear(e));
 
-        const handleSample = (x, y, radius, phase) => {
-            const sample = { x, y, radius, phase, time: performance.now() };
-            if (phase === 'start') {
-                this.analyzer.reset();
-                this.engine.reset();
-            }
-            const motion = this.analyzer.analyze(sample);
-            const status = this.engine.draw(motion);
+    // expose recorded motion data for developer/debug use (no visible UI)
+    window.YUBISHO = {
+      exportData: () => this.recorder.getData(),
+      strokeCount: () => this.strokeHistory.length
+    };
+  }
 
-            if (Config.DEBUG) {
-                document.getElementById('db-speed').textContent = motion.speed.toFixed(2);
-                document.getElementById('db-ink').textContent = status.ink.toFixed(2);
-                document.getElementById('db-dry').textContent = status.dryness.toFixed(2);
-            }
-        };
+  _resize() {
+    const w = window.innerWidth;
+    const h = window.innerHeight;
+    const dpr = window.devicePixelRatio || 1;
 
-        // Touch Events
-        let activeId = null;
-        this.canvas.addEventListener('touchstart', (e) => {
-            e.preventDefault();
-            const t = e.changedTouches[0];
-            activeId = t.identifier;
-            handleSample(t.clientX, t.clientY, t.majorRadius || 14, 'start');
-        }, { passive: false });
-
-        this.canvas.addEventListener('touchmove', (e) => {
-            e.preventDefault();
-            for (let i = 0; i < e.changedTouches.length; i++) {
-                const t = e.changedTouches[i];
-                if (t.identifier === activeId) {
-                    handleSample(t.clientX, t.clientY, t.majorRadius || 14, 'move');
-                    break;
-                }
-            }
-        }, { passive: false });
-
-        const handleTouchEnd = (e) => {
-            e.preventDefault();
-            for (let i = 0; i < e.changedTouches.length; i++) {
-                const t = e.changedTouches[i];
-                if (t.identifier === activeId) {
-                    handleSample(t.clientX, t.clientY, t.majorRadius || 14, 'end');
-                    activeId = null;
-                    break;
-                }
-            }
-        };
-        this.canvas.addEventListener('touchend', handleTouchEnd, { passive: false });
-        this.canvas.addEventListener('touchcancel', handleTouchEnd, { passive: false });
-
-        // Mouse Fallback
-        let isMouseDown = false;
-        this.canvas.addEventListener('mousedown', (e) => {
-            isMouseDown = true;
-            handleSample(e.clientX, e.clientY, 14, 'start');
-        });
-        this.canvas.addEventListener('mousemove', (e) => {
-            if (isMouseDown) handleSample(e.clientX, e.clientY, 14, 'move');
-        });
-        window.addEventListener('mouseup', (e) => {
-            if (isMouseDown) {
-                isMouseDown = false;
-                handleSample(e.clientX, e.clientY, 14, 'end');
-            }
-        });
-
-        // Debug Trigger
-        let taps = 0, timer = null;
-        document.getElementById('secret-trigger').addEventListener('click', () => {
-            taps++;
-            clearTimeout(timer);
-            if (taps >= 3) {
-                Config.DEBUG = !Config.DEBUG;
-                document.getElementById('debug-overlay').style.display = Config.DEBUG ? 'block' : 'none';
-                taps = 0;
-            } else {
-                timer = setTimeout(() => { taps = 0; }, 500);
-            }
-        });
+    // preserve existing ink when resizing, by redrawing scaled copy
+    let snapshot = null;
+    if (this.inkCanvas.width > 0) {
+      snapshot = document.createElement('canvas');
+      snapshot.width = this.inkCanvas.width;
+      snapshot.height = this.inkCanvas.height;
+      snapshot.getContext('2d').drawImage(this.inkCanvas, 0, 0);
     }
 
-    resize() {
-        this.paper.resize(window.innerWidth, window.innerHeight);
+    this.paper.resize(w, h, dpr);
+
+    this.inkCanvas.width = Math.round(w * dpr);
+    this.inkCanvas.height = Math.round(h * dpr);
+    this.inkCanvas.style.width = w + 'px';
+    this.inkCanvas.style.height = h + 'px';
+    this.inkCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+    if (snapshot) {
+      this.inkCtx.save();
+      this.inkCtx.setTransform(1, 0, 0, 1, 0, 0);
+      this.inkCtx.drawImage(snapshot, 0, 0, snapshot.width, snapshot.height,
+                             0, 0, this.inkCanvas.width, this.inkCanvas.height);
+      this.inkCtx.restore();
+      this.inkCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
     }
+
+    this.w = w; this.h = h; this.dpr = dpr;
+  }
+
+  _onStart(sample) {
+    if (!this.hintDismissed) {
+      this.hintDismissed = true;
+      this.hintEl.classList.add('hidden');
+    }
+    this.motion.reset();
+    this.ink.startStroke();
+    this.recorder.startStroke();
+    this.strokeSampleCount = 0;
+
+    const m = this.motion.update(sample);
+    this._depositTapered(m, true);
+    this.recorder.addPoint(m, this.w, this.h);
+  }
+
+  _onMove(sample) {
+    const m = this.motion.update(sample);
+    this._depositTapered(m, false);
+    this.recorder.addPoint(m, this.w, this.h);
+    if (DEBUG) this.lastMotion = m;
+  }
+
+  _onEnd(sample) {
+    const m = this.motion.update(sample);
+    this._depositEndTaper(m);
+    this.recorder.addPoint(m, this.w, this.h);
+    this.recorder.endStroke();
+    this.strokeHistory.push(this.recorder.strokes[this.recorder.strokes.length - 1]);
+  }
+
+  _depositTapered(m, isStart) {
+    const state = this.ink.update(m);
+    let radiusScale = 1;
+    if (isStart || this.strokeSampleCount < CONFIG.render.startTaperPoints) {
+      radiusScale = (this.strokeSampleCount + 1) / CONFIG.render.startTaperPoints;
+      radiusScale = clamp(radiusScale, 0.15, 1);
+    }
+    this.strokeSampleCount++;
+    this.renderer.stamp(m.x, m.y, m.radius * radiusScale, state.inkAmount, state.bleed, m.speed);
+  }
+
+  _depositEndTaper(m) {
+    const steps = CONFIG.render.endTaperSteps;
+    let state = this.ink.update(m);
+    for (let i = 0; i < steps; i++) {
+      const f = 1 - (i + 1) / steps; // fades to 0
+      const stepDist = m.radius * 0.6;
+      const x = m.x + Math.cos(m.direction) * stepDist * (i + 1) * 0.5;
+      const y = m.y + Math.sin(m.direction) * stepDist * (i + 1) * 0.5;
+      state.inkAmount *= 0.85;
+      this.renderer.stamp(x, y, m.radius * f, state.inkAmount, state.bleed * f, m.speed + i * 0.02);
+    }
+  }
+
+  _maybeDevClear(e) {
+    const zone = 80;
+    const inZone = (e.clientX > this.w - zone) && (e.clientY > this.h - zone);
+    if (!inZone) return;
+    const now = performance.now();
+    if (now - this.lastTapTime < 400) {
+      this.renderer.clear(this.inkCanvas.width, this.inkCanvas.height);
+      this.recorder.clear();
+      this.strokeHistory = [];
+    }
+    this.lastTapTime = now;
+  }
+
+  _debugLoop() {
+    const now = performance.now();
+    const dt = now - this._lastFrameT;
+    this._lastFrameT = now;
+    this.fps = Math.round(1000 / Math.max(1, dt));
+
+    const m = this.lastMotion || {};
+    this.debugEl.textContent =
+`FPS: ${this.fps}
+canvas: ${this.w}x${this.h}  dpr:${this.dpr}
+strokes: ${this.strokeHistory.length}
+x:${(m.x||0).toFixed(1)} y:${(m.y||0).toFixed(1)}
+speed:${(m.speed||0).toFixed(3)} accel:${(m.acceleration||0).toFixed(4)}
+radius:${(m.radius||0).toFixed(2)} dir:${(m.direction||0).toFixed(2)}
+inkAmount:${this.ink.inkAmount ? this.ink.inkAmount.toFixed(3) : '-'}
+bleed:${this.ink.idleBleed ? this.ink.idleBleed.toFixed(3) : '-'}`;
+
+    requestAnimationFrame(this._debugLoop.bind(this));
+  }
 }
 
-window.addEventListener('DOMContentLoaded', () => { new App(); });
+// =========================================================
+// 9. small utilities
+// =========================================================
+function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
+function lerp(a, b, t) { return a + (b - a) * t; }
+function mapRange(v, inMin, inMax, outMin, outMax) {
+  const t = clamp((v - inMin) / (inMax - inMin), 0, 1);
+  return outMin + t * (outMax - outMin);
+}
+
+// =========================================================
+// 10. boot
+// =========================================================
+window.addEventListener('load', () => { new App(); });
+
+})();
 </script>
 </body>
 </html>
