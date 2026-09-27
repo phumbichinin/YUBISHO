@@ -1,0 +1,633 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>YUBISHO - Phase 1 Prototype</title>
+    <style>
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+            user-select: none;
+            -webkit-user-select: none;
+            touch-action: none;
+        }
+        body, html {
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+            background-color: #f4f1ea;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        }
+        #canvas-container {
+            width: 100%;
+            height: 100%;
+            position: relative;
+        }
+        canvas {
+            display: block;
+            width: 100%;
+            height: 100%;
+        }
+        /* デバッグOverlay */
+        #debug-overlay {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            background: rgba(0, 0, 0, 0.75);
+            color: #00ff66;
+            font-family: monospace;
+            font-size: 11px;
+            padding: 10px;
+            border-radius: 4px;
+            pointer-events: none;
+            display: none;
+            z-index: 100;
+            line-height: 1.4;
+        }
+        /* デバッグ切替領域（右上トリプルタップ用） */
+        #secret-trigger {
+            position: absolute;
+            top: 0;
+            right: 0;
+            width: 80px;
+            height: 80px;
+            z-index: 1000;
+        }
+    </style>
+</head>
+<body>
+
+<div id="canvas-container">
+    <canvas id="yubisho-canvas"></canvas>
+    <div id="debug-overlay">
+        FPS: <span id="db-fps">0</span><br>
+        Touch Phase: <span id="db-phase">none</span><br>
+        Pos: <span id="db-pos">0, 0</span><br>
+        Speed: <span id="db-speed">0.00</span><br>
+        Contact Radius: <span id="db-radius">0.00</span><br>
+        Ink Amount: <span id="db-ink">0.00</span><br>
+        Strokes Recorded: <span id="db-strokes">0</span>
+    </div>
+    <div id="secret-trigger"></div>
+</div>
+
+<script>
+/**
+ * YUBISHO Phase 1
+ * ------------------------------------------------------------------
+ * 構成クラス:
+ * - Config: パラメータ設定
+ * - Paper: 和紙の生成・描画
+ * - TouchInput: ポインター／タッチ座標の正規化と取得
+ * - MotionAnalyzer: 速度・加速度・接触半径の運動解析
+ * - InkModel: 墨量・濃淡・掠れ・滲み等の計算エンジン
+ * - StrokeRenderer: Canvas 2D への墨スタンプ描画
+ * - StrokeRecorder: 運筆データの記録・正規化保存
+ * - App: 全体の統括・メインループ
+ */
+
+// ------------------------------------------------------------------
+// 1. Config
+// ------------------------------------------------------------------
+const Config = {
+    DEBUG: false,
+    INK_CONSUMPTION_RATE: 0.0025, // 速度に応じた墨消費係数
+    INK_RECOVERY_RATE: 0.08,      // 静止・起筆時の墨回復（溜まり）
+    BASE_RADIUS: 18,              // 基本半径 (px)
+    MAX_RADIUS_BONUS: 28,         // 接触面積(majorRadius)による可変幅
+    BLEED_MAX: 1.3,               // 滲みの最大倍率
+    STAMP_SPACING_RATIO: 0.18,    // スタンプ配置の間隔係数 (小さいほど密度高)
+    INHERIT_INK_MAX: 1.0          // 最大墨量
+};
+
+// ------------------------------------------------------------------
+// 2. Paper (和紙テクスチャのCanvas生成)
+// ------------------------------------------------------------------
+class Paper {
+    constructor(canvas) {
+        this.canvas = canvas;
+        this.ctx = canvas.getContext('2d');
+        this.paperCanvas = document.createElement('canvas');
+        this.isGenerated = false;
+    }
+
+    resize(w, h) {
+        this.canvas.width = w;
+        this.canvas.height = h;
+        this.paperCanvas.width = w;
+        this.paperCanvas.height = h;
+        this.generatePaperTexture(w, h);
+    }
+
+    generatePaperTexture(w, h) {
+        const pCtx = this.paperCanvas.getContext('2d');
+        
+        // 淡い生成色ベース
+        pCtx.fillStyle = '#f4f0e8';
+        pCtx.fillRect(0, 0, w, h);
+
+        const imgData = pCtx.getImageData(0, 0, w, h);
+        const data = imgData.data;
+
+        // 微細なノイズと弱繊維の生成
+        for (let i = 0; i < data.length; i += 4) {
+            const noise = (Math.random() - 0.5) * 12;
+            data[i]     = Math.min(255, Math.max(0, data[i] + noise));     // R
+            data[i + 1] = Math.min(255, Math.max(0, data[i + 1] + noise)); // G
+            data[i + 2] = Math.min(255, Math.max(0, data[i + 2] + noise)); // B
+        }
+        pCtx.putImageData(imgData, 0, 0);
+
+        // 薄い繊維（縦横）の微小ランダム描画
+        pCtx.strokeStyle = 'rgba(180, 170, 150, 0.05)';
+        pCtx.lineWidth = 0.8;
+        
+        // 横繊維
+        for (let i = 0; i < h; i += 4) {
+            if (Math.random() > 0.4) {
+                pCtx.beginPath();
+                pCtx.moveTo(0, i + (Math.random() - 0.5) * 2);
+                pCtx.lineTo(w, i + (Math.random() - 0.5) * 2);
+                pCtx.stroke();
+            }
+        }
+        // 縦繊維
+        for (let j = 0; j < w; j += 6) {
+            if (Math.random() > 0.5) {
+                pCtx.beginPath();
+                pCtx.moveTo(j + (Math.random() - 0.5) * 2, 0);
+                pCtx.lineTo(j + (Math.random() - 0.5) * 2, h);
+                pCtx.stroke();
+            }
+        }
+
+        this.isGenerated = true;
+        this.render();
+    }
+
+    render() {
+        if (!this.isGenerated) return;
+        this.ctx.drawImage(this.paperCanvas, 0, 0);
+    }
+
+    clear() {
+        this.render();
+    }
+}
+
+// ------------------------------------------------------------------
+// 3. TouchInput
+// ------------------------------------------------------------------
+class TouchInput {
+    constructor(element, onSampleCallback) {
+        this.element = element;
+        this.onSample = onSampleCallback;
+        this.activeTouchId = null;
+        this.initEvents();
+    }
+
+    initEvents() {
+        // タッチイベント (iOS / Android)
+        this.element.addEventListener('touchstart', (e) => this.handleStart(e), { passive: false });
+        this.element.addEventListener('touchmove', (e) => this.handleMove(e), { passive: false });
+        this.element.addEventListener('touchend', (e) => this.handleEnd(e), { passive: false });
+        this.element.addEventListener('touchcancel', (e) => this.handleEnd(e), { passive: false });
+
+        // マウスフォールバック (PC検証用)
+        let isMouseDown = false;
+        this.element.addEventListener('mousedown', (e) => {
+            isMouseDown = true;
+            this.emitSample(e.clientX, e.clientY, 12, 'start');
+        });
+        this.element.addEventListener('mousemove', (e) => {
+            if (!isMouseDown) return;
+            this.emitSample(e.clientX, e.clientY, 12, 'move');
+        });
+        window.addEventListener('mouseup', (e) => {
+            if (!isMouseDown) return;
+            isMouseDown = false;
+            this.emitSample(e.clientX, e.clientY, 12, 'end');
+        });
+    }
+
+    handleStart(e) {
+        e.preventDefault();
+        if (this.activeTouchId !== null) return;
+        const touch = e.changedTouches[0];
+        this.activeTouchId = touch.identifier;
+        const radius = touch.majorRadius || 12;
+        this.emitSample(touch.clientX, touch.clientY, radius, 'start');
+    }
+
+    handleMove(e) {
+        e.preventDefault();
+        for (let i = 0; i < e.changedTouches.length; i++) {
+            const touch = e.changedTouches[i];
+            if (touch.identifier === this.activeTouchId) {
+                const radius = touch.majorRadius || 12;
+                this.emitSample(touch.clientX, touch.clientY, radius, 'move');
+                break;
+            }
+        }
+    }
+
+    handleEnd(e) {
+        e.preventDefault();
+        for (let i = 0; i < e.changedTouches.length; i++) {
+            const touch = e.changedTouches[i];
+            if (touch.identifier === this.activeTouchId) {
+                const radius = touch.majorRadius || 12;
+                this.emitSample(touch.clientX, touch.clientY, radius, 'end');
+                this.activeTouchId = null;
+                break;
+            }
+        }
+    }
+
+    emitSample(x, y, radius, phase) {
+        this.onSample({
+            x: x,
+            y: y,
+            time: performance.now(),
+            radius: radius,
+            phase: phase
+        });
+    }
+}
+
+// ------------------------------------------------------------------
+// 4. MotionAnalyzer
+// ------------------------------------------------------------------
+class MotionAnalyzer {
+    constructor() {
+        this.lastSample = null;
+    }
+
+    analyze(sample) {
+        if (!this.lastSample || sample.phase === 'start') {
+            this.lastSample = sample;
+            return {
+                ...sample,
+                vx: 0,
+                vy: 0,
+                speed: 0,
+                acceleration: 0,
+                direction: 0,
+                contactRadius: sample.radius
+            };
+        }
+
+        const dt = Math.max(1, sample.time - this.lastSample.time); // ms
+        const dx = sample.x - this.lastSample.x;
+        const dy = sample.y - this.lastSample.y;
+        const distance = Math.hypot(dx, dy);
+
+        const vx = dx / dt;
+        const vy = dy / dt;
+        const speed = distance / dt; // px/ms
+
+        const prevSpeed = this.lastSample.speed || 0;
+        const acceleration = (speed - prevSpeed) / dt;
+        const direction = Math.atan2(dy, dx);
+
+        // contactRadiusへのマッピング（接触面積調整）
+        const contactRadius = Math.min(Config.BASE_RADIUS + Config.MAX_RADIUS_BONUS, 
+                                Math.max(Config.BASE_RADIUS * 0.5, sample.radius));
+
+        const analyzed = {
+            ...sample,
+            vx,
+            vy,
+            speed,
+            acceleration,
+            direction,
+            contactRadius
+        };
+
+        this.lastSample = analyzed;
+        return analyzed;
+    }
+
+    reset() {
+        this.lastSample = null;
+    }
+}
+
+// ------------------------------------------------------------------
+// 5. InkModel
+// ------------------------------------------------------------------
+class InkModel {
+    constructor() {
+        this.inkAmount = Config.INHERIT_INK_MAX;
+    }
+
+    reset() {
+        this.inkAmount = Config.INHERIT_INK_MAX;
+    }
+
+    update(motion) {
+        if (motion.phase === 'start') {
+            this.inkAmount = Config.INHERIT_INK_MAX;
+        } else if (motion.speed < 0.05) {
+            // 低速・停止状態での墨の滞留・補給
+            this.inkAmount = Math.min(Config.INHERIT_INK_MAX, this.inkAmount + Config.INK_RECOVERY_RATE);
+        } else {
+            // 運動速度に応じた墨量の消費
+            const consumption = motion.speed * Config.INK_CONSUMPTION_RATE * 10;
+            this.inkAmount = Math.max(0.02, this.inkAmount - consumption);
+        }
+
+        // 濃淡（Density）
+        const density = Math.min(1.0, this.inkAmount * (1.2 - Math.min(0.8, motion.speed * 0.2)));
+
+        // 掠れ度（Dryness）: 墨量が低く速度が高いほど顕著に
+        const dryness = Math.max(0, (motion.speed * 0.35) - (this.inkAmount * 0.8));
+
+        // 滲み（Bleed）: 墨量が多く、速度が遅いほど滲む
+        const bleed = Math.min(Config.BLEED_MAX, 1.0 + (this.inkAmount * 0.4) / (motion.speed + 0.2));
+
+        return {
+            inkAmount: this.inkAmount,
+            density: Math.max(0.1, density),
+            dryness: Math.min(0.9, dryness),
+            bleed: bleed
+        };
+    }
+}
+
+// ------------------------------------------------------------------
+// 6. StrokeRenderer (墨スタンプ描画エンジン)
+// ------------------------------------------------------------------
+class StrokeRenderer {
+    constructor(ctx) {
+        this.ctx = ctx;
+        this.lastRenderedPoint = null;
+    }
+
+    reset() {
+        this.lastRenderedPoint = null;
+    }
+
+    renderPoint(motion, inkProps) {
+        if (motion.phase === 'start') {
+            // 起筆（漸増的に筆を置く表現）
+            this.drawStampGroup(motion.x, motion.y, motion.contactRadius * 0.6, inkProps, motion.direction);
+            this.lastRenderedPoint = { x: motion.x, y: motion.y, radius: motion.contactRadius };
+            return;
+        }
+
+        if (!this.lastRenderedPoint) {
+            this.lastRenderedPoint = { x: motion.x, y: motion.y, radius: motion.contactRadius };
+            return;
+        }
+
+        // 収筆（指離れ時の自然な抜け計算）
+        let targetX = motion.x;
+        let targetY = motion.y;
+        let currentRadius = motion.contactRadius;
+
+        if (motion.phase === 'end') {
+            // 直前のベクトル方向に短い抜け足を生成
+            const exitDistance = Math.min(30, motion.speed * 15);
+            targetX += Math.cos(motion.direction) * exitDistance;
+            targetY += Math.sin(motion.direction) * exitDistance;
+            currentRadius *= 0.2; // 端点を細く収縮
+        }
+
+        // スタンプ間の補間描画
+        const dx = targetX - this.lastRenderedPoint.x;
+        const dy = targetY - this.lastRenderedPoint.y;
+        const dist = Math.hypot(dx, dy);
+
+        const step = Math.max(1.5, currentRadius * Config.STAMP_SPACING_RATIO);
+        const steps = Math.ceil(dist / step);
+
+        for (let i = 0; i < steps; i++) {
+            const t = i / steps;
+            const x = this.lastRenderedPoint.x + dx * t;
+            const y = this.lastRenderedPoint.y + dy * t;
+
+            // 補間ステップごとの半径減衰（収筆）
+            const interpolatedRadius = (motion.phase === 'end')
+                ? currentRadius + (this.lastRenderedPoint.radius - currentRadius) * (1 - t)
+                : currentRadius;
+
+            this.drawStampGroup(x, y, interpolatedRadius, inkProps, motion.direction);
+        }
+
+        this.lastRenderedPoint = { x: targetX, y: targetY, radius: currentRadius };
+    }
+
+    /**
+     * 墨スタンプ1個の多重描画処理（Core + Dry Edge + Bleed）
+     */
+    drawStampGroup(x, y, radius, inkProps, angle) {
+        this.ctx.save();
+        this.ctx.translate(x, y);
+
+        // 1. 外周の滲み (Bleed Region)
+        if (inkProps.bleed > 1.0) {
+            const bleedRadius = radius * inkProps.bleed;
+            const bleedGrad = this.ctx.createRadialGradient(0, 0, radius * 0.5, 0, 0, bleedRadius);
+            bleedGrad.addColorStop(0, `rgba(20, 20, 20, ${inkProps.density * 0.15})`);
+            bleedGrad.addColorStop(1, 'rgba(20, 20, 20, 0)');
+
+            this.ctx.fillStyle = bleedGrad;
+            this.ctx.beginPath();
+            this.ctx.arc(0, 0, bleedRadius, 0, Math.PI * 2);
+            this.ctx.fill();
+        }
+
+        // 2. 墨核 (Core) と掠れ (Dry Edge)
+        const coreRadius = Math.max(1, radius * (1 - inkProps.dryness * 0.3));
+        const grad = this.ctx.createRadialGradient(0, 0, 0, 0, 0, coreRadius);
+        
+        // わずかに青茶に揺れる深い墨色
+        const rVal = Math.floor(10 + Math.random() * 8);
+        const gVal = Math.floor(12 + Math.random() * 8);
+        const bVal = Math.floor(15 + Math.random() * 10);
+        
+        grad.addColorStop(0, `rgba(${rVal}, ${gVal}, ${bVal}, ${inkProps.density})`);
+        grad.addColorStop(0.7, `rgba(${rVal}, ${gVal}, ${bVal}, ${inkProps.density * 0.85})`);
+        grad.addColorStop(1, `rgba(${rVal}, ${gVal}, ${bVal}, 0)`);
+
+        this.ctx.fillStyle = grad;
+
+        // 不規則な歪みを持つ輪郭の生成
+        this.ctx.beginPath();
+        const numPoints = 8;
+        for (let i = 0; i < numPoints; i++) {
+            const a = (i / numPoints) * Math.PI * 2;
+            // 掠れ度が高いほど輪郭の歪みが激しくなる
+            const noise = 1.0 - (Math.random() * inkProps.dryness * 0.5);
+            const pr = coreRadius * noise;
+            const px = Math.cos(a) * pr;
+            const py = Math.sin(a) * pr;
+
+            if (i === 0) this.ctx.moveTo(px, py);
+            else this.ctx.lineTo(px, py);
+        }
+        this.ctx.closePath();
+        this.ctx.fill();
+
+        // 3. 掠れ時の「紙の露出」ノイズ（内部穴あけ処理）
+        if (inkProps.dryness > 0.2) {
+            const holeCount = Math.floor(inkProps.dryness * 4);
+            this.ctx.fillStyle = 'rgba(244, 240, 232, 0.45)'; // 和紙のベース色で微小カット
+            for (let h = 0; h < holeCount; h++) {
+                const hx = (Math.random() - 0.5) * coreRadius * 1.2;
+                const hy = (Math.random() - 0.5) * coreRadius * 1.2;
+                const hr = Math.random() * (coreRadius * 0.25);
+                this.ctx.beginPath();
+                this.ctx.arc(hx, hy, hr, 0, Math.PI * 2);
+                this.ctx.fill();
+            }
+        }
+
+        this.ctx.restore();
+    }
+}
+
+// ------------------------------------------------------------------
+// 7. StrokeRecorder (運筆データの保存・0~1正規化)
+// ------------------------------------------------------------------
+class StrokeRecorder {
+    constructor() {
+        this.strokes = [];
+        this.currentStroke = null;
+    }
+
+    startStroke(canvasWidth, canvasHeight) {
+        this.currentStroke = { points: [] };
+        this.strokes.push(this.currentStroke);
+    }
+
+    recordPoint(motion, canvasWidth, canvasHeight) {
+        if (!this.currentStroke) return;
+        this.currentStroke.points.push({
+            x: Number((motion.x / canvasWidth).toFixed(4)),
+            y: Number((motion.y / canvasHeight).toFixed(4)),
+            t: Math.round(motion.time),
+            speed: Number(motion.speed.toFixed(3)),
+            radius: Number((motion.contactRadius / canvasWidth).toFixed(4))
+        });
+    }
+
+    exportJSON(canvasWidth, canvasHeight) {
+        return JSON.stringify({
+            version: 1,
+            canvas: { width: canvasWidth, height: canvasHeight },
+            strokes: this.strokes
+        }, null, 2);
+    }
+}
+
+// ------------------------------------------------------------------
+// 8. App (メインロジック & ループ)
+// ------------------------------------------------------------------
+class App {
+    constructor() {
+        this.canvas = document.getElementById('yubisho-canvas');
+        this.paper = new Paper(this.canvas);
+        this.motionAnalyzer = new MotionAnalyzer();
+        this.inkModel = new InkModel();
+        this.renderer = new StrokeRenderer(this.paper.ctx);
+        this.recorder = new StrokeRecorder();
+
+        this.width = window.innerWidth;
+        this.height = window.innerHeight;
+
+        this.fps = 0;
+        this.frameCount = 0;
+        this.lastFpsTime = performance.now();
+
+        this.init();
+    }
+
+    init() {
+        this.resize();
+        window.addEventListener('resize', () => this.resize());
+
+        // タッチ入力の購読
+        new TouchInput(this.canvas, (sample) => this.handleInputSample(sample));
+
+        // 秘密のデバッグ切替（右上3タップ）
+        let tapCount = 0;
+        let tapTimer = null;
+        document.getElementById('secret-trigger').addEventListener('click', () => {
+            tapCount++;
+            clearTimeout(tapTimer);
+            if (tapCount >= 3) {
+                Config.DEBUG = !Config.DEBUG;
+                document.getElementById('debug-overlay').style.display = Config.DEBUG ? 'block' : 'none';
+                tapCount = 0;
+            } else {
+                tapTimer = setTimeout(() => { tapCount = 0; }, 600);
+            }
+        });
+
+        // アニメーションフレーム（デバッグ情報更新用）
+        const loop = () => {
+            this.updateDebugFPS();
+            requestAnimationFrame(loop);
+        };
+        requestAnimationFrame(loop);
+    }
+
+    resize() {
+        this.width = window.innerWidth;
+        this.height = window.innerHeight;
+        this.paper.resize(this.width, this.height);
+    }
+
+    handleInputSample(sample) {
+        if (sample.phase === 'start') {
+            this.motionAnalyzer.reset();
+            this.inkModel.reset();
+            this.renderer.reset();
+            this.recorder.startStroke(this.width, this.height);
+        }
+
+        const motion = this.motionAnalyzer.analyze(sample);
+        const inkProps = this.inkModel.update(motion);
+
+        // 描画実行
+        this.renderer.renderPoint(motion, inkProps);
+
+        // データ記録
+        this.recorder.recordPoint(motion, this.width, this.height);
+
+        // デバッグ表示の更新
+        if (Config.DEBUG) {
+            document.getElementById('db-phase').textContent = motion.phase;
+            document.getElementById('db-pos').textContent = `${Math.round(motion.x)}, ${Math.round(motion.y)}`;
+            document.getElementById('db-speed').textContent = motion.speed.toFixed(2);
+            document.getElementById('db-radius').textContent = motion.contactRadius.toFixed(1);
+            document.getElementById('db-ink').textContent = inkProps.inkAmount.toFixed(2);
+            document.getElementById('db-strokes').textContent = this.recorder.strokes.length;
+        }
+    }
+
+    updateDebugFPS() {
+        this.frameCount++;
+        const now = performance.now();
+        if (now - this.lastFpsTime >= 1000) {
+            this.fps = this.frameCount;
+            this.frameCount = 0;
+            this.lastFpsTime = now;
+            if (Config.DEBUG) {
+                document.getElementById('db-fps').textContent = this.fps;
+            }
+        }
+    }
+}
+
+// アプリケーション起動
+window.addEventListener('DOMContentLoaded', () => {
+    window.app = new App();
+});
+</script>
+</body>
+</html>
