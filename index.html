@@ -49,8 +49,14 @@
 (function () {
 'use strict';
 
+// =========================================================
+// 0. DEBUG SWITCH
+// =========================================================
 const DEBUG = false;
 
+// =========================================================
+// 1. CONFIG — all tunable parameters live here
+// =========================================================
 const CONFIG = {
   paper: {
     baseColor: [237, 229, 210],
@@ -59,38 +65,101 @@ const CONFIG = {
     fiberAlpha: 0.035,
     noiseAlpha: 0.02
   },
+
+  // --- contact: raw touch geometry -> strokeRadius (line width). Independent of ink. ---
   contact: {
-    minRadius: 3.0,
-    maxRadius: 26.0,
-    smoothing: 0.35,
-    fallbackRadius: 8.0,
-    fallbackJitter: 0.5
+    minRadius: 2.6,
+    maxRadius: 15,
+    smoothing: 0.30,
+    fallbackRadius: 6.5,
+    fallbackJitter: 1.2
   },
+
+  // --- ink: how much ink remains in the stroke. Consumption only, no auto-refill. ---
   ink: {
     startAmount: 1.0,
+    minAmount: 0.03,
     maxAmount: 1.0,
-    minAmount: 0.04,
-    consumptionPerPixel: 0.0016,
-    consumptionSpeedGain: 0.0030,
-    replenishRate: 0.00065,
-    replenishSpeedCeiling: 0.25,
-    idleBleedRate: 0.00045,
-    idleBleedMax: 0.9,
-    idleSpeedThreshold: 0.02
+    baseConsumptionPerPixel: 0.0011,   // consumed per px moved, regardless of anything else
+    areaConsumptionFactor: 0.00006,    // extra consumption scaling with contact radius (px)
+    speedConsumptionFactor: 0.0026     // extra consumption scaling with speed (px/ms)
   },
+
+  // --- transfer: how efficiently remaining ink moves onto the paper right now ---
+  transfer: {
+    minEfficiency: 0.22,          // efficiency at/above speedForMinEfficiency
+    maxEfficiency: 1.0,           // efficiency at speed ~ 0
+    speedForMinEfficiency: 0.9,   // px/ms speed at which efficiency bottoms out
+    contactFactorMin: 0.85,       // small contact -> slightly less transfer
+    contactFactorMax: 1.15,       // large contact -> slightly more transfer
+    dwellThresholdSpeed: 0.05,    // below this speed, counts as "dwelling"
+    dwellRampRate: 0.006,         // per ms, how fast dwelling boosts efficiency
+    dwellFactorMax: 1.4
+  },
+
+  // --- bleed: ink spreading into paper fiber while dwelling / transferring well ---
+  bleed: {
+    rate: 0.0035,        // per ms, grows while dwelling & transferring
+    decay: 0.010,        // per ms, shrinks while moving
+    maxAmount: 1.0,
+    radiusFactor: 1.6,   // halo radius relative to core stamp radius at full bleed
+    alphaFactor: 0.28
+  },
+
+  // --- dryness (kasure): ink fails to fully reach the paper -> fibers show through ---
+  dryness: {
+    inkThreshold: 0.30,       // below this remaining ink, dryness becomes possible
+    speedThreshold: 0.28,     // above this speed, dryness becomes possible
+    transferInfluence: 0.6,   // how much a low transferAmount adds to dryness
+    maxFactor: 0.75,
+    gapCountMax: 5,
+    gapSizeFactor: 0.55,      // gap size relative to stroke radius
+    directionalStretch: 2.4   // gap elongation along travel direction
+  },
+
+  // --- render: stamp shape / color, independent of the physical model above ---
   render: {
-    centerAlpha: 0.88,
-    shapeWobble: 0.12,
-    positionJitter: 0.2,
-    speedWidthFactor: 0.25,
-    kasureInkThreshold: 0.32,
-    kasureSpeedThreshold: 0.30,
-    kasureMaxProb: 0.55,
-    inkColorBase: [18, 16, 20],
-    inkColorJitter: 4
+    coreAlphaMax: 0.82,
+    edgeSoftnessStop: 0.55,
+    shapeWobble: 0.16,
+    positionJitter: 0.3,
+    muraCount: 3,
+    muraAlpha: 0.10,
+    inkColorBase: [22, 20, 24],
+    inkColorJitter: 6,
+    startTaperPoints: 5,
+    startTaperMinScale: 0.4,
+    releaseFadeSteps: 2,        // fades AT the last real position, no positional extension
+    releaseFadeDecay: 0.45
   }
 };
 
+// =========================================================
+// 2. small utilities
+// =========================================================
+function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
+function lerp(a, b, t) { return a + (b - a) * t; }
+function mapRange(v, inMin, inMax, outMin, outMax) {
+  const t = clamp((v - inMin) / (inMax - inMin), 0, 1);
+  return outMin + t * (outMax - outMin);
+}
+
+// Deterministic PRNG (mulberry32) — one instance per stroke, seeded once.
+// This is the ONLY source of "randomness" used while rendering a stroke,
+// so the same input motion + the same seed can reproduce the same ink later.
+function makeRNG(seed) {
+  let a = seed >>> 0;
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+// =========================================================
+// 3. Paper — static washi background (unchanged from Phase 1)
+// =========================================================
 class Paper {
   constructor(canvas) {
     this.canvas = canvas;
@@ -121,10 +190,8 @@ class Paper {
       const x = Math.random() * w;
       const y = Math.random() * h;
       const radius = 80 + Math.random() * 220;
-      const delta = (Math.random() - 0.5) * 2 * CONFIG.paper.unevenness * 255;
       const grad = ctx.createRadialGradient(x, y, 0, x, y, radius);
-      const c = Math.max(0, Math.min(255, r + delta));
-      grad.addColorStop(0, `rgba(${c},${c * (g / r)},${c * (b / r)},0.06)`);
+      grad.addColorStop(0, `rgba(${r},${g},${b},0.06)`);
       grad.addColorStop(1, 'rgba(0,0,0,0)');
       ctx.fillStyle = grad;
       ctx.fillRect(0, 0, w, h);
@@ -155,52 +222,60 @@ class Paper {
   }
 }
 
+// =========================================================
+// 4. TouchInput — raw pointer capture, single touch only (unchanged)
+// =========================================================
 class TouchInput {
   constructor(el, callbacks) {
     this.el = el;
     this.cb = callbacks;
-    this.activeId = null;
+    this.activePointerId = null;
 
-    // PointerEventsに一本化して描画バグを回避
     el.addEventListener('pointerdown', this._onDown.bind(this), { passive: false });
     el.addEventListener('pointermove', this._onMove.bind(this), { passive: false });
     el.addEventListener('pointerup', this._onUp.bind(this), { passive: false });
     el.addEventListener('pointercancel', this._onUp.bind(this), { passive: false });
+    el.addEventListener('pointerleave', this._onLeaveMaybe.bind(this), { passive: false });
     el.addEventListener('contextmenu', (e) => e.preventDefault());
+    document.addEventListener('gesturestart', (e) => e.preventDefault());
   }
 
   _extract(e) {
-    let size = 0;
-    if (e.width && e.height) {
-      size = (e.width + e.height) / 2;
-    }
     return {
       x: e.clientX, y: e.clientY, t: e.timeStamp,
-      size: size, pressure: e.pressure || 0
+      width: e.width || 0, height: e.height || 0, pressure: e.pressure || 0
     };
   }
 
   _onDown(e) {
-    if (this.activeId !== null) return;
-    this.activeId = e.pointerId;
+    if (this.activePointerId !== null) return;
+    this.activePointerId = e.pointerId;
     e.preventDefault();
     this.cb.onStart(this._extract(e));
   }
 
   _onMove(e) {
-    if (e.pointerId !== this.activeId) return;
+    if (e.pointerId !== this.activePointerId) return;
     e.preventDefault();
     this.cb.onMove(this._extract(e));
   }
 
   _onUp(e) {
-    if (e.pointerId !== this.activeId) return;
+    if (e.pointerId !== this.activePointerId) return;
     e.preventDefault();
-    this.activeId = null;
+    this.activePointerId = null;
     this.cb.onEnd(this._extract(e));
+  }
+
+  _onLeaveMaybe(e) {
+    if (e.pointerId !== this.activePointerId) return;
+    this._onUp(e);
   }
 }
 
+// =========================================================
+// 5. MotionAnalyzer — velocity / acceleration / direction / contactRadius (unchanged)
+// =========================================================
 class MotionAnalyzer {
   constructor(config) {
     this.cfg = config;
@@ -218,12 +293,12 @@ class MotionAnalyzer {
     let vx = 0, vy = 0, speed = 0, acceleration = 0, direction = 0, dt = 16, dist = 0;
 
     let rawRadius;
-    if (sample.size && sample.size > 0) {
-      rawRadius = mapRange(sample.size, 6, 36, cfg.minRadius, cfg.maxRadius);
+    if (sample.width > 0 || sample.height > 0) {
+      const avg = ((sample.width || sample.height) + (sample.height || sample.width)) / 2;
+      rawRadius = mapRange(avg, 4, 40, cfg.minRadius, cfg.maxRadius);
     } else {
       rawRadius = cfg.fallbackRadius + (Math.random() - 0.5) * cfg.fallbackJitter;
     }
-
     rawRadius = clamp(rawRadius, cfg.minRadius, cfg.maxRadius);
     this.smoothRadius = (this.smoothRadius === null)
       ? rawRadius
@@ -248,130 +323,208 @@ class MotionAnalyzer {
       x: sample.x, y: sample.y, t: sample.t,
       vx, vy, speed, acceleration, direction,
       dist, dt,
-      radius: this.smoothRadius
+      radius: this.smoothRadius   // contact-derived stroke radius, NOT ink-derived
     };
   }
 }
 
+// =========================================================
+// 6. InkModel v2
+//    Separates: inkAmount (remaining) / transferAmount (this instant) /
+//    bleedAmount (accumulated spread) / dryness (0-1 factor).
+//    No auto-replenish. Consumption depends on distance, contact area, speed.
+// =========================================================
 class InkModel {
-  constructor(config) {
-    this.cfg = config;
-  }
-
   startStroke() {
-    this.inkAmount = this.cfg.startAmount;
-    this.idleBleed = 0;
+    this.inkAmount = CONFIG.ink.startAmount;
+    this.dwellFactor = 1.0;
+    this.bleedAmount = 0;
   }
 
   update(motion) {
-    const cfg = this.cfg;
     const speed = motion.speed || 0;
     const dist = motion.dist || 0;
     const dt = motion.dt || 16;
+    const radius = motion.radius;
 
-    const consumption = dist * (cfg.consumptionPerPixel + speed * cfg.consumptionSpeedGain);
-    this.inkAmount -= consumption;
+    // --- consumption: distance x (base + area effect + speed effect) ---
+    const areaTerm = radius * CONFIG.ink.areaConsumptionFactor;
+    const speedTerm = speed * CONFIG.ink.speedConsumptionFactor;
+    const consumption = dist * (CONFIG.ink.baseConsumptionPerPixel + areaTerm + speedTerm);
+    this.inkAmount = clamp(this.inkAmount - consumption, CONFIG.ink.minAmount, CONFIG.ink.maxAmount);
 
-    if (speed < cfg.replenishSpeedCeiling) {
-      this.inkAmount += cfg.replenishRate * dt;
-    }
-    this.inkAmount = clamp(this.inkAmount, cfg.minAmount, cfg.maxAmount);
-
-    if (speed < cfg.idleSpeedThreshold) {
-      this.idleBleed = Math.min(cfg.idleBleedMax, this.idleBleed + cfg.idleBleedRate * dt);
+    // --- dwell factor: sustained near-stillness boosts transfer efficiency ---
+    if (speed < CONFIG.transfer.dwellThresholdSpeed) {
+      this.dwellFactor = Math.min(
+        CONFIG.transfer.dwellFactorMax,
+        this.dwellFactor + CONFIG.transfer.dwellRampRate * dt
+      );
     } else {
-      this.idleBleed = Math.max(0, this.idleBleed - cfg.idleBleedRate * dt * 2);
+      this.dwellFactor = Math.max(
+        1.0,
+        this.dwellFactor - CONFIG.transfer.dwellRampRate * dt * 1.5
+      );
     }
 
-    return { inkAmount: this.inkAmount, bleed: this.idleBleed };
+    // --- transfer efficiency: how well ink moves onto paper right now ---
+    const speedEfficiency = mapRange(
+      speed, 0, CONFIG.transfer.speedForMinEfficiency,
+      CONFIG.transfer.maxEfficiency, CONFIG.transfer.minEfficiency
+    );
+    const contactFactor = mapRange(
+      radius, CONFIG.contact.minRadius, CONFIG.contact.maxRadius,
+      CONFIG.transfer.contactFactorMin, CONFIG.transfer.contactFactorMax
+    );
+    const transferAmount = clamp(
+      this.inkAmount * speedEfficiency * contactFactor * this.dwellFactor,
+      0, 1
+    );
+
+    // --- bleed: grows while dwelling with good transfer, decays while moving ---
+    if (speed < CONFIG.transfer.dwellThresholdSpeed) {
+      this.bleedAmount = Math.min(
+        CONFIG.bleed.maxAmount,
+        this.bleedAmount + CONFIG.bleed.rate * dt * transferAmount
+      );
+    } else {
+      this.bleedAmount = Math.max(0, this.bleedAmount - CONFIG.bleed.decay * dt);
+    }
+
+    // --- dryness: low ink + high speed + poor transfer => fibers show through ---
+    let dryness = 0;
+    if (this.inkAmount < CONFIG.dryness.inkThreshold && speed > CONFIG.dryness.speedThreshold) {
+      const inkFactor = clamp(
+        (CONFIG.dryness.inkThreshold - this.inkAmount) / CONFIG.dryness.inkThreshold, 0, 1
+      );
+      const speedFactor = clamp(
+        (speed - CONFIG.dryness.speedThreshold) / (CONFIG.dryness.speedThreshold * 1.4), 0, 1
+      );
+      const transferFactor = clamp(1 - transferAmount, 0, 1) * CONFIG.dryness.transferInfluence;
+      dryness = clamp(
+        (inkFactor * 0.5 + speedFactor * 0.5 + transferFactor) * CONFIG.dryness.maxFactor,
+        0, CONFIG.dryness.maxFactor
+      );
+    }
+
+    return {
+      inkAmount: this.inkAmount,
+      transferAmount,
+      bleedAmount: this.bleedAmount,
+      dryness
+    };
   }
 }
 
+// =========================================================
+// 7. StrokeRenderer v2
+//    strokeRadius (width) comes only from contact.
+//    Darkness comes only from transferAmount.
+//    Bleed follows the stamp's own irregular silhouette.
+//    Dryness carves directional gaps (destination-out) so the paper
+//    underneath genuinely shows through, instead of lowering alpha.
+// =========================================================
 class StrokeRenderer {
   constructor(ctx) {
     this.ctx = ctx;
   }
 
-  stamp(x, y, radius, inkAmount, bleed, speed) {
-    const ctx = this.ctx;
-    const cfg = CONFIG.render;
-
-    if (inkAmount < cfg.kasureInkThreshold && speed > cfg.kasureSpeedThreshold) {
-      const inkFactor = clamp((cfg.kasureInkThreshold - inkAmount) / cfg.kasureInkThreshold, 0, 1);
-      const speedFactor = clamp((speed - cfg.kasureSpeedThreshold) / (cfg.kasureSpeedThreshold * 1.5), 0, 1);
-      const dryGap = inkFactor * speedFactor * cfg.kasureMaxProb;
-      if (Math.random() < dryGap) return { drawn: false, dryGap };
+  _wobblePoints(x, y, radius, wobble, rng) {
+    const points = [];
+    const n = 10;
+    for (let i = 0; i <= n; i++) {
+      const a = (i / n) * Math.PI * 2;
+      const rr = radius * (1 - wobble / 2 + rng() * wobble);
+      points.push([x + Math.cos(a) * rr, y + Math.sin(a) * rr]);
     }
-
-    const speedNarrow = 1 - clamp(speed * cfg.speedWidthFactor, 0, 0.35);
-    const r = Math.max(0.8, radius * speedNarrow * (0.6 + inkAmount * 0.5));
-
-    const jx = x + (Math.random() - 0.5) * cfg.positionJitter;
-    const jy = y + (Math.random() - 0.5) * cfg.positionJitter;
-
-    const [br, bg, bb] = CONFIG.render.inkColorBase;
-    const jitter = CONFIG.render.inkColorJitter;
-    const cr = clamp(br + (Math.random() - 0.5) * jitter, 0, 255);
-    const cg = clamp(bg + (Math.random() - 0.5) * jitter, 0, 255);
-    const cb = clamp(bb + (Math.random() - 0.5) * jitter, 0, 255);
-
-    const centerAlpha = cfg.centerAlpha * (0.6 + inkAmount * 0.4);
-
-    ctx.save();
-
-    // 墨の滲みグラデーション
-    const gradRadius = r * (1 + bleed * 0.6);
-    const grad = ctx.createRadialGradient(jx, jy, 0, jx, jy, gradRadius);
-    
-    grad.addColorStop(0.0, `rgba(${cr},${cg},${cb},${centerAlpha})`);
-    grad.addColorStop(0.4, `rgba(${cr},${cg},${cb},${centerAlpha * 0.92})`);
-    grad.addColorStop(0.7, `rgba(${cr + 10},${cg + 8},${cb + 12},${centerAlpha * 0.45})`);
-    grad.addColorStop(0.88, `rgba(${cr + 15},${cg + 12},${cb + 18},${centerAlpha * 0.18})`);
-    grad.addColorStop(1.0, `rgba(${cr + 20},${cg + 15},${cb + 22},0)`);
-
-    const wobble = cfg.shapeWobble;
-    const points = 10;
-    ctx.beginPath();
-    for (let i = 0; i <= points; i++) {
-      const a = (i / points) * Math.PI * 2;
-      const rr = gradRadius * (1 - wobble / 2 + Math.random() * wobble);
-      const px = jx + Math.cos(a) * rr;
-      const py = jy + Math.sin(a) * rr;
-      if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
-    }
-    ctx.closePath();
-
-    ctx.fillStyle = grad;
-    ctx.fill();
-    ctx.restore();
-
-    return { drawn: true, radius: r, opacity: centerAlpha };
+    return points;
   }
 
-  // 払いの先端処理（丸スタンプではなく、鋭利な穂先三角形を描画）
-  drawSharpTip(m) {
+  _fillWobble(x, y, radius, wobble, rng, gradientFn) {
     const ctx = this.ctx;
-    const tipLength = Math.min(30, Math.max(10, m.speed * 15));
-    const angle = m.direction;
-    const r = m.radius * 0.8;
-
-    const [br, bg, bb] = CONFIG.render.inkColorBase;
-
-    const tipX = m.x + Math.cos(angle) * tipLength;
-    const tipY = m.y + Math.sin(angle) * tipLength;
-
-    const perpX = Math.cos(angle + Math.PI / 2) * r;
-    const perpY = Math.sin(angle + Math.PI / 2) * r;
-
-    ctx.save();
-    ctx.fillStyle = `rgba(${br},${bg},${bb},0.85)`;
+    const pts = this._wobblePoints(x, y, radius, wobble, rng);
     ctx.beginPath();
-    ctx.moveTo(m.x + perpX, m.y + perpY);
-    ctx.lineTo(m.x - perpX, m.y - perpY);
-    ctx.lineTo(tipX, tipY);
+    pts.forEach(([px, py], i) => { i === 0 ? ctx.moveTo(px, py) : ctx.lineTo(px, py); });
     ctx.closePath();
+    ctx.fillStyle = gradientFn(radius);
     ctx.fill();
-    ctx.restore();
+  }
+
+  stamp(x, y, strokeRadius, inkState, direction, rng) {
+    const ctx = this.ctx;
+    const cfg = CONFIG.render;
+    const { transferAmount, bleedAmount, dryness } = inkState;
+
+    const jx = x + (rng() - 0.5) * cfg.positionJitter;
+    const jy = y + (rng() - 0.5) * cfg.positionJitter;
+
+    const [br, bg, bb] = cfg.inkColorBase;
+    const jitter = cfg.inkColorJitter;
+    const cr = clamp(br + (rng() - 0.5) * jitter, 0, 255);
+    const cg = clamp(bg + (rng() - 0.5) * jitter, 0, 255);
+    const cb = clamp(bb + (rng() - 0.5) * jitter, 0, 255);
+
+    const coreAlpha = cfg.coreAlphaMax * clamp(transferAmount, 0.04, 1);
+
+    // 1) bleed halo — follows the same wobbly silhouette, larger & very soft
+    if (bleedAmount > 0.03) {
+      const bleedR = strokeRadius * CONFIG.bleed.radiusFactor * (0.6 + bleedAmount);
+      this._fillWobble(jx, jy, bleedR, cfg.shapeWobble * 1.4, rng, (r) => {
+        const g = ctx.createRadialGradient(jx, jy, 0, jx, jy, r);
+        g.addColorStop(0, `rgba(${cr},${cg},${cb},${coreAlpha * CONFIG.bleed.alphaFactor * bleedAmount})`);
+        g.addColorStop(1, `rgba(${cr},${cg},${cb},0)`);
+        return g;
+      });
+    }
+
+    // 2) core stamp — three-tone radial gradient, irregular silhouette
+    this._fillWobble(jx, jy, strokeRadius, cfg.shapeWobble, rng, (r) => {
+      const g = ctx.createRadialGradient(jx, jy, 0, jx, jy, r);
+      g.addColorStop(0, `rgba(${cr},${cg},${cb},${coreAlpha})`);
+      g.addColorStop(cfg.edgeSoftnessStop, `rgba(${cr},${cg},${cb},${coreAlpha * 0.55})`);
+      g.addColorStop(1, `rgba(${cr},${cg},${cb},0)`);
+      return g;
+    });
+
+    // 3) internal mura — a few faint density variations inside the core
+    for (let i = 0; i < cfg.muraCount; i++) {
+      const a = rng() * Math.PI * 2;
+      const d = rng() * strokeRadius * 0.6;
+      const mx = jx + Math.cos(a) * d;
+      const my = jy + Math.sin(a) * d;
+      const mr = strokeRadius * (0.15 + rng() * 0.25);
+      const sign = rng() > 0.5 ? 1 : -1;
+      ctx.beginPath();
+      ctx.arc(mx, my, mr, 0, Math.PI * 2);
+      ctx.fillStyle = sign > 0
+        ? `rgba(${cr},${cg},${cb},${cfg.muraAlpha})`
+        : `rgba(255,250,240,${cfg.muraAlpha * 0.5})`;
+      ctx.fill();
+    }
+
+    // 4) dryness — carve directional gaps so paper genuinely shows through
+    if (dryness > 0.05) {
+      const gapCount = Math.max(1, Math.round(dryness * CONFIG.dryness.gapCountMax));
+      ctx.save();
+      ctx.globalCompositeOperation = 'destination-out';
+      for (let i = 0; i < gapCount; i++) {
+        const along = (rng() - 0.5) * strokeRadius * 1.6;
+        const across = (rng() - 0.5) * strokeRadius * 0.7;
+        const gx = jx + Math.cos(direction) * along - Math.sin(direction) * across;
+        const gy = jy + Math.sin(direction) * along + Math.cos(direction) * across;
+        const gapLen = strokeRadius * CONFIG.dryness.gapSizeFactor * CONFIG.dryness.directionalStretch * (0.5 + rng() * 0.6);
+        const gapWidth = strokeRadius * CONFIG.dryness.gapSizeFactor * (0.4 + rng() * 0.5);
+        ctx.save();
+        ctx.translate(gx, gy);
+        ctx.rotate(direction);
+        ctx.scale(gapLen / gapWidth, 1);
+        ctx.beginPath();
+        ctx.arc(0, 0, gapWidth, 0, Math.PI * 2);
+        ctx.fillStyle = `rgba(0,0,0,${clamp(dryness * (0.55 + rng() * 0.35), 0, 0.95)})`;
+        ctx.fill();
+        ctx.restore();
+      }
+      ctx.restore();
+    }
   }
 
   clear(w, h) {
@@ -379,20 +532,82 @@ class StrokeRenderer {
   }
 }
 
+// =========================================================
+// 8. StrokeRecorder — normalized motion + ink-state data, kept separate
+//    from the rendered pixels. Stores a per-stroke seed for reproducibility.
+// =========================================================
+class StrokeRecorder {
+  constructor() {
+    this.strokes = [];
+    this.current = null;
+  }
+
+  startStroke(seed) {
+    this.current = { seed, points: [] };
+  }
+
+  addPoint(motion, inkState, w, h) {
+    if (!this.current) return;
+    this.current.points.push({
+      x: motion.x / w,
+      y: motion.y / h,
+      t: motion.t,
+      vx: motion.vx,
+      vy: motion.vy,
+      speed: motion.speed,
+      acceleration: motion.acceleration,
+      radius: motion.radius / Math.max(w, h),
+      direction: motion.direction,
+      inkAmount: inkState.inkAmount,
+      transferAmount: inkState.transferAmount,
+      bleedAmount: inkState.bleedAmount,
+      dryness: inkState.dryness
+    });
+  }
+
+  endStroke() {
+    if (this.current && this.current.points.length > 0) {
+      this.strokes.push(this.current);
+    }
+    this.current = null;
+  }
+
+  getData() {
+    return { version: 2, coordinateSystem: 'normalized', strokes: this.strokes };
+  }
+
+  clear() {
+    this.strokes = [];
+    this.current = null;
+  }
+}
+
+// =========================================================
+// 9. App — wiring (structure unchanged from Phase 1)
+// =========================================================
 class App {
   constructor() {
     this.paperCanvas = document.getElementById('paper');
     this.inkCanvas = document.getElementById('ink');
     this.hintEl = document.getElementById('hint');
+    this.debugEl = document.getElementById('debug');
 
     this.paper = new Paper(this.paperCanvas);
     this.inkCtx = this.inkCanvas.getContext('2d');
     this.renderer = new StrokeRenderer(this.inkCtx);
     this.motion = new MotionAnalyzer(CONFIG.contact);
-    this.ink = new InkModel(CONFIG.ink);
+    this.ink = new InkModel();
+    this.recorder = new StrokeRecorder();
 
+    this.strokeHistory = [];
     this.strokeSampleCount = 0;
     this.hintDismissed = false;
+    this.lastTapTime = 0;
+    this.fps = 0;
+    this._lastFrameT = performance.now();
+    this.rng = null;
+    this.lastMotion = null;
+    this.lastInkState = null;
 
     this._resize();
     window.addEventListener('resize', () => this._resize());
@@ -402,6 +617,18 @@ class App {
       onMove: (s) => this._onMove(s),
       onEnd: (s) => this._onEnd(s)
     });
+
+    if (DEBUG) {
+      this.debugEl.style.display = 'block';
+      requestAnimationFrame(this._debugLoop.bind(this));
+    }
+
+    this.inkCanvas.addEventListener('pointerdown', (e) => this._maybeDevClear(e));
+
+    window.YUBISHO = {
+      exportData: () => this.recorder.getData(),
+      strokeCount: () => this.strokeHistory.length
+    };
   }
 
   _resize() {
@@ -442,41 +669,107 @@ class App {
       this.hintDismissed = true;
       this.hintEl.classList.add('hidden');
     }
+
+    const seed = Math.floor(Math.random() * 0xFFFFFFFF);
+    this.rng = makeRNG(seed);
     this.motion.reset();
     this.ink.startStroke();
+    this.recorder.startStroke(seed);
     this.strokeSampleCount = 0;
 
     const m = this.motion.update(sample);
-    this._deposit(m);
+    const state = this.ink.update(m);
+    this._depositTapered(m, state);
+    this.recorder.addPoint(m, state, this.w, this.h);
+    this.lastMotion = m; this.lastInkState = state;
   }
 
   _onMove(sample) {
     const m = this.motion.update(sample);
-    this._deposit(m);
+    const state = this.ink.update(m);
+    this._depositTapered(m, state);
+    this.recorder.addPoint(m, state, this.w, this.h);
+    this.lastMotion = m; this.lastInkState = state;
   }
 
   _onEnd(sample) {
     const m = this.motion.update(sample);
-    // 払い（指を離した際）の丸みを完全に防ぐため、先端に鋭利な三角形（抜き）を描く
-    if (m.speed > 0.15) {
-      this.renderer.drawSharpTip(m);
+    const state = this.ink.update(m);
+    this.recorder.addPoint(m, state, this.w, this.h);
+    this._depositRelease(m, state);
+    this.recorder.endStroke();
+    this.strokeHistory.push(this.recorder.strokes[this.recorder.strokes.length - 1]);
+    this.lastMotion = m; this.lastInkState = state;
+  }
+
+  // start-of-stroke taper: contact establishing itself, not an animated flourish
+  _depositTapered(m, state) {
+    let radiusScale = 1;
+    if (this.strokeSampleCount < CONFIG.render.startTaperPoints) {
+      const t = (this.strokeSampleCount + 1) / CONFIG.render.startTaperPoints;
+      radiusScale = clamp(t, CONFIG.render.startTaperMinScale, 1);
+    }
+    this.strokeSampleCount++;
+    this.renderer.stamp(m.x, m.y, m.radius * radiusScale, state, m.direction, this.rng);
+  }
+
+  // release: fades AT the last real contact point only — no positional extension
+  _depositRelease(m, state) {
+    let decayInk = state.inkAmount;
+    let decayTransfer = state.transferAmount;
+    let decayBleed = state.bleedAmount;
+    for (let i = 0; i < CONFIG.render.releaseFadeSteps; i++) {
+      decayTransfer *= CONFIG.render.releaseFadeDecay;
+      decayBleed *= CONFIG.render.releaseFadeDecay;
+      const fadeState = {
+        inkAmount: decayInk,
+        transferAmount: decayTransfer,
+        bleedAmount: decayBleed,
+        dryness: state.dryness
+      };
+      const radiusFade = m.radius * (1 - (i + 1) * 0.12);
+      this.renderer.stamp(m.x, m.y, Math.max(0.6, radiusFade), fadeState, m.direction, this.rng);
     }
   }
 
-  _deposit(m) {
-    const state = this.ink.update(m);
-    this.strokeSampleCount++;
-    this.renderer.stamp(m.x, m.y, m.radius, state.inkAmount, state.bleed, m.speed);
+  _maybeDevClear(e) {
+    const zone = 80;
+    const inZone = (e.clientX > this.w - zone) && (e.clientY > this.h - zone);
+    if (!inZone) return;
+    const now = performance.now();
+    if (now - this.lastTapTime < 400) {
+      this.renderer.clear(this.inkCanvas.width, this.inkCanvas.height);
+      this.recorder.clear();
+      this.strokeHistory = [];
+    }
+    this.lastTapTime = now;
+  }
+
+  _debugLoop() {
+    const now = performance.now();
+    const dt = now - this._lastFrameT;
+    this._lastFrameT = now;
+    this.fps = Math.round(1000 / Math.max(1, dt));
+
+    const m = this.lastMotion || {};
+    const s = this.lastInkState || {};
+    this.debugEl.textContent =
+`FPS: ${this.fps}
+canvas: ${this.w}x${this.h}  dpr:${this.dpr}
+strokes: ${this.strokeHistory.length}
+speed:${(m.speed || 0).toFixed(3)}  radius:${(m.radius || 0).toFixed(2)}
+inkAmount:${(s.inkAmount || 0).toFixed(3)}
+transfer:${(s.transferAmount || 0).toFixed(3)}
+bleed:${(s.bleedAmount || 0).toFixed(3)}
+dryness:${(s.dryness || 0).toFixed(3)}`;
+
+    requestAnimationFrame(this._debugLoop.bind(this));
   }
 }
 
-function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
-function lerp(a, b, t) { return a + (b - a) * t; }
-function mapRange(v, inMin, inMax, outMin, outMax) {
-  const t = clamp((v - inMin) / (inMax - inMin), 0, 1);
-  return outMin + t * (outMax - outMin);
-}
-
+// =========================================================
+// 10. boot
+// =========================================================
 window.addEventListener('load', () => { new App(); });
 
 })();
