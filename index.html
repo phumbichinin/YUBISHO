@@ -49,62 +49,54 @@
 (function () {
 'use strict';
 
-// =========================================================
-// 0. DEBUG SWITCH
-// =========================================================
 const DEBUG = false;
 
-// =========================================================
-// 1. CONFIG — all tunable parameters live here
-// =========================================================
 const CONFIG = {
   paper: {
-    baseColor: [237, 229, 210],   // washi base (RGB)
-    unevenness: 0.05,             // large-scale light/dark mura
-    fiberDensity: 900,            // number of fiber strokes drawn
+    baseColor: [237, 229, 210],
+    unevenness: 0.05,
+    fiberDensity: 900,
     fiberAlpha: 0.035,
     noiseAlpha: 0.02
   },
   contact: {
-    minRadius: 2.6,
-    maxRadius: 15,
-    smoothing: 0.30,              // low-pass filter factor (0-1, higher = snappier)
-    fallbackRadius: 6.5,          // used when width/height unavailable (mouse)
-    fallbackJitter: 1.2
+    // 【修正】接触面積（指の太さ）への感度幅を拡張
+    minRadius: 3.0,
+    maxRadius: 28.0,
+    smoothing: 0.40,               // 面積変化に対する反応度
+    fallbackRadius: 8.0,
+    fallbackJitter: 0.5
   },
   ink: {
     startAmount: 1.0,
     maxAmount: 1.0,
     minAmount: 0.04,
-    consumptionPerPixel: 0.0016,      // base ink used per px moved
-    consumptionSpeedGain: 0.0030,     // extra consumption scaling with speed
-    replenishRate: 0.00065,           // per ms, active only at low speed
-    replenishSpeedCeiling: 0.25,      // speed (px/ms) below which replenish happens
-    idleBleedRate: 0.00045,           // per ms while nearly stationary
+    consumptionPerPixel: 0.0016,
+    consumptionSpeedGain: 0.0030,
+    replenishRate: 0.00065,
+    replenishSpeedCeiling: 0.25,
+    idleBleedRate: 0.00045,
     idleBleedMax: 0.9,
     idleSpeedThreshold: 0.02
   },
   render: {
-    stampSpacing: 1.6,            // draw a stamp every N px of travel (min)
-    centerAlpha: 0.80,            // base alpha at stamp center (before ink/opacity scaling)
-    shapeWobble: 0.18,            // 0-1, irregularity of stamp silhouette
-    positionJitter: 0.35,         // px, tiny randomness in stamp placement
-    speedWidthFactor: 0.38,       // how much high speed narrows the radius
-    bleedRadiusFactor: 1.35,      // how much larger the soft bleed halo is vs core
-    bleedAlphaFactor: 0.22,
-    kasureInkThreshold: 0.32,     // below this ink amount, dryness can appear
-    kasureSpeedThreshold: 0.30,   // above this speed, dryness can appear
+    stampSpacing: 1.6,
+    centerAlpha: 0.88,             // 墨の核を濃く
+    shapeWobble: 0.15,             // 輪郭のわずかな歪み
+    positionJitter: 0.2,
+    speedWidthFactor: 0.25,
+    bleedRadiusFactor: 1.45,       // 【修正】墨の染み出し半径
+    bleedAlphaFactor: 0.35,
+    kasureInkThreshold: 0.32,
+    kasureSpeedThreshold: 0.30,
     kasureMaxProb: 0.55,
-    startTaperPoints: 7,          // number of samples over which stroke ramps up
-    endTaperSteps: 7,             // number of samples used to fade the stroke out
-    inkColorBase: [22, 20, 24],   // near-black with faint cool tint
-    inkColorJitter: 6             // +/- per-channel jitter
+    startTaperPoints: 5,
+    endTaperSteps: 7,
+    inkColorBase: [18, 16, 20],    // 濃い墨色
+    inkColorJitter: 4
   }
 };
 
-// =========================================================
-// 2. Paper — static washi background
-// =========================================================
 class Paper {
   constructor(canvas) {
     this.canvas = canvas;
@@ -130,7 +122,6 @@ class Paper {
     ctx.fillStyle = `rgb(${r},${g},${b})`;
     ctx.fillRect(0, 0, w, h);
 
-    // large-scale unevenness (a few soft blotches of light/dark)
     const blotchCount = 10;
     for (let i = 0; i < blotchCount; i++) {
       const x = Math.random() * w;
@@ -145,7 +136,6 @@ class Paper {
       ctx.fillRect(0, 0, w, h);
     }
 
-    // fine fiber texture
     ctx.strokeStyle = `rgba(60,50,40,${CONFIG.paper.fiberAlpha})`;
     ctx.lineWidth = 0.6;
     for (let i = 0; i < CONFIG.paper.fiberDensity; i++) {
@@ -159,7 +149,6 @@ class Paper {
       ctx.stroke();
     }
 
-    // fine grain noise (sparse dots, cheap)
     ctx.fillStyle = `rgba(40,35,28,${CONFIG.paper.noiseAlpha})`;
     const dotCount = Math.floor((w * h) / 900);
     for (let i = 0; i < dotCount; i++) {
@@ -172,65 +161,106 @@ class Paper {
   }
 }
 
-// =========================================================
-// 3. TouchInput — raw pointer capture (single-touch only)
-// =========================================================
 class TouchInput {
   constructor(el, callbacks) {
     this.el = el;
     this.cb = callbacks;
     this.activePointerId = null;
 
+    // 【修正】Touch Events & Pointer Events 両対応で接触面積（radius / width/height）を正確に取得
+    el.addEventListener('touchstart', this._onTouchStart.bind(this), { passive: false });
+    el.addEventListener('touchmove', this._onTouchMove.bind(this), { passive: false });
+    el.addEventListener('touchend', this._onTouchEnd.bind(this), { passive: false });
+    el.addEventListener('touchcancel', this._onTouchEnd.bind(this), { passive: false });
+
     el.addEventListener('pointerdown', this._onDown.bind(this), { passive: false });
     el.addEventListener('pointermove', this._onMove.bind(this), { passive: false });
     el.addEventListener('pointerup', this._onUp.bind(this), { passive: false });
     el.addEventListener('pointercancel', this._onUp.bind(this), { passive: false });
-    el.addEventListener('pointerleave', this._onLeaveMaybe.bind(this), { passive: false });
     el.addEventListener('contextmenu', (e) => e.preventDefault());
-    document.addEventListener('gesturestart', (e) => e.preventDefault());
   }
 
-  _extract(e) {
+  _extractPointer(e) {
+    // PointerEventでの接触面抽出
+    let size = 0;
+    if (e.width && e.height) {
+      size = (e.width + e.height) / 2;
+    }
     return {
-      x: e.clientX,
-      y: e.clientY,
-      t: e.timeStamp,
-      width: e.width || 0,
-      height: e.height || 0,
-      pressure: e.pressure || 0
+      x: e.clientX, y: e.clientY, t: e.timeStamp,
+      size: size, pressure: e.pressure || 0
     };
   }
 
+  _extractTouch(t, timeStamp) {
+    // TouchEventでの接触面（radiusX/radiusYまたはmajorRadius）抽出
+    let size = 0;
+    if (t.radiusX && t.radiusY) {
+      size = t.radiusX + t.radiusY;
+    } else if (t.touchType === 'stylus' && t.force) {
+      size = t.force * 20;
+    }
+    return {
+      x: t.clientX, y: t.clientY, t: timeStamp,
+      size: size, pressure: t.force || 0
+    };
+  }
+
+  _onTouchStart(e) {
+    if (this.activePointerId !== null) return;
+    const t = e.changedTouches[0];
+    this.activePointerId = t.identifier;
+    e.preventDefault();
+    this.cb.onStart(this._extractTouch(t, e.timeStamp));
+  }
+
+  _onTouchMove(e) {
+    for (let i = 0; i < e.changedTouches.length; i++) {
+      const t = e.changedTouches[i];
+      if (t.identifier === this.activePointerId) {
+        e.preventDefault();
+        this.cb.onMove(this._extractTouch(t, e.timeStamp));
+        break;
+      }
+    }
+  }
+
+  _onTouchEnd(e) {
+    for (let i = 0; i < e.changedTouches.length; i++) {
+      const t = e.changedTouches[i];
+      if (t.identifier === this.activePointerId) {
+        e.preventDefault();
+        this.activePointerId = null;
+        this.cb.onEnd(this._extractTouch(t, e.timeStamp));
+        break;
+      }
+    }
+  }
+
   _onDown(e) {
-    if (this.activePointerId !== null) return; // ignore multi-touch
+    if (e.pointerType === 'touch') return; // touchイベント側で処理済み
+    if (this.activePointerId !== null) return;
     this.activePointerId = e.pointerId;
     e.preventDefault();
-    this.cb.onStart(this._extract(e));
+    this.cb.onStart(this._extractPointer(e));
   }
 
   _onMove(e) {
+    if (e.pointerType === 'touch') return;
     if (e.pointerId !== this.activePointerId) return;
     e.preventDefault();
-    this.cb.onMove(this._extract(e));
+    this.cb.onMove(this._extractPointer(e));
   }
 
   _onUp(e) {
+    if (e.pointerType === 'touch') return;
     if (e.pointerId !== this.activePointerId) return;
     e.preventDefault();
     this.activePointerId = null;
-    this.cb.onEnd(this._extract(e));
-  }
-
-  _onLeaveMaybe(e) {
-    // treat leaving the surface while pressed as an end, to avoid stuck strokes
-    if (e.pointerId !== this.activePointerId) return;
-    this._onUp(e);
+    this.cb.onEnd(this._extractPointer(e));
   }
 }
 
-// =========================================================
-// 4. MotionAnalyzer — derives velocity / acceleration / direction / contactRadius
-// =========================================================
 class MotionAnalyzer {
   constructor(config) {
     this.cfg = config;
@@ -247,14 +277,15 @@ class MotionAnalyzer {
     const cfg = this.cfg;
     let vx = 0, vy = 0, speed = 0, acceleration = 0, direction = 0, dt = 16, dist = 0;
 
-    // contact radius from width/height, or fallback
+    // 【修正】指の接触面積（size）に応じて半径をダイナミックに変更
     let rawRadius;
-    if (sample.width > 0 || sample.height > 0) {
-      const avg = ((sample.width || sample.height) + (sample.height || sample.width)) / 2;
-      rawRadius = mapRange(avg, 4, 40, cfg.minRadius, cfg.maxRadius);
+    if (sample.size && sample.size > 0) {
+      // 面積に応じた太さのマッピング
+      rawRadius = mapRange(sample.size, 6, 36, cfg.minRadius, cfg.maxRadius);
     } else {
       rawRadius = cfg.fallbackRadius + (Math.random() - 0.5) * cfg.fallbackJitter;
     }
+
     rawRadius = clamp(rawRadius, cfg.minRadius, cfg.maxRadius);
     this.smoothRadius = (this.smoothRadius === null)
       ? rawRadius
@@ -267,7 +298,7 @@ class MotionAnalyzer {
       dist = Math.hypot(dx, dy);
       vx = dx / dt;
       vy = dy / dt;
-      speed = Math.hypot(vx, vy); // px/ms
+      speed = Math.hypot(vx, vy);
       acceleration = (speed - this.smoothSpeed) / dt;
       direction = Math.atan2(dy, dx);
       this.smoothSpeed = lerp(this.smoothSpeed, speed, 0.4);
@@ -284,9 +315,6 @@ class MotionAnalyzer {
   }
 }
 
-// =========================================================
-// 5. InkModel — internal ink amount / bleed state for one stroke
-// =========================================================
 class InkModel {
   constructor(config) {
     this.cfg = config;
@@ -303,17 +331,14 @@ class InkModel {
     const dist = motion.dist || 0;
     const dt = motion.dt || 16;
 
-    // consumption from movement
     const consumption = dist * (cfg.consumptionPerPixel + speed * cfg.consumptionSpeedGain);
     this.inkAmount -= consumption;
 
-    // slow replenishment while moving gently
     if (speed < cfg.replenishSpeedCeiling) {
       this.inkAmount += cfg.replenishRate * dt;
     }
     this.inkAmount = clamp(this.inkAmount, cfg.minAmount, cfg.maxAmount);
 
-    // idle bleed accumulator (near-stationary contact)
     if (speed < cfg.idleSpeedThreshold) {
       this.idleBleed = Math.min(cfg.idleBleedMax, this.idleBleed + cfg.idleBleedRate * dt);
     } else {
@@ -324,9 +349,6 @@ class InkModel {
   }
 }
 
-// =========================================================
-// 6. StrokeRenderer — turns motion+ink samples into ink stamps on canvas
-// =========================================================
 class StrokeRenderer {
   constructor(ctx) {
     this.ctx = ctx;
@@ -336,18 +358,15 @@ class StrokeRenderer {
     const ctx = this.ctx;
     const cfg = CONFIG.render;
 
-    // dryness (kasure): probabilistically skip / weaken the stamp
-    let dryGap = 0;
     if (inkAmount < cfg.kasureInkThreshold && speed > cfg.kasureSpeedThreshold) {
       const inkFactor = clamp((cfg.kasureInkThreshold - inkAmount) / cfg.kasureInkThreshold, 0, 1);
       const speedFactor = clamp((speed - cfg.kasureSpeedThreshold) / (cfg.kasureSpeedThreshold * 1.5), 0, 1);
-      dryGap = inkFactor * speedFactor * cfg.kasureMaxProb;
+      const dryGap = inkFactor * speedFactor * cfg.kasureMaxProb;
       if (Math.random() < dryGap) return { drawn: false, dryGap };
     }
 
-    // speed narrows the perceived radius slightly
-    const speedNarrow = 1 - clamp(speed * cfg.speedWidthFactor, 0, 0.45);
-    const r = Math.max(0.6, radius * speedNarrow * (0.55 + inkAmount * 0.6));
+    const speedNarrow = 1 - clamp(speed * cfg.speedWidthFactor, 0, 0.35);
+    const r = Math.max(0.8, radius * speedNarrow * (0.6 + inkAmount * 0.5));
 
     const jx = x + (Math.random() - 0.5) * cfg.positionJitter;
     const jy = y + (Math.random() - 0.5) * cfg.positionJitter;
@@ -358,43 +377,44 @@ class StrokeRenderer {
     const cg = clamp(bg + (Math.random() - 0.5) * jitter, 0, 255);
     const cb = clamp(bb + (Math.random() - 0.5) * jitter, 0, 255);
 
-    const centerAlpha = cfg.centerAlpha * (0.5 + inkAmount * 0.5);
+    const centerAlpha = cfg.centerAlpha * (0.6 + inkAmount * 0.4);
 
-    // soft bleed halo first (if idle bleeding is present)
-    if (bleed > 0.02) {
-      const bleedR = r * cfg.bleedRadiusFactor * (1 + bleed);
-      const g2 = ctx.createRadialGradient(jx, jy, 0, jx, jy, bleedR);
-      g2.addColorStop(0, `rgba(${cr},${cg},${cb},${centerAlpha * cfg.bleedAlphaFactor * bleed})`);
-      g2.addColorStop(1, `rgba(${cr},${cg},${cb},0)`);
-      ctx.fillStyle = g2;
-      ctx.beginPath();
-      ctx.arc(jx, jy, bleedR, 0, Math.PI * 2);
-      ctx.fill();
-    }
-
-    // main stamp: irregular blob via wobbled radius per angle
-    const wobble = cfg.shapeWobble;
-    const points = 10;
     ctx.save();
+
+    // 【修正】「墨感のある滲み」を作り出す3段グラデーションスタンプ
+    // 墨の芯（濃い部分）と、和紙に不規則に染み出た境界（滲み）をグラデーションストップで構築
+    const gradRadius = r * (1 + bleed * 0.6);
+    const grad = ctx.createRadialGradient(jx, jy, 0, jx, jy, gradRadius);
+    
+    // 1. 芯（ほぼ不透明な真の墨）
+    grad.addColorStop(0.0, `rgba(${cr},${cg},${cb},${centerAlpha})`);
+    grad.addColorStop(0.4, `rgba(${cr},${cg},${cb},${centerAlpha * 0.92})`);
+    
+    // 2. 滲みへの遷移領域（墨が滲み始めて和紙の繊維に吸い込まれる）
+    grad.addColorStop(0.7, `rgba(${cr + 10},${cg + 8},${cb + 12},${centerAlpha * 0.45})`);
+    grad.addColorStop(0.88, `rgba(${cr + 15},${cg + 12},${cb + 18},${centerAlpha * 0.18})`);
+    
+    // 3. 滲みの外縁（非常に薄いぼかし）
+    grad.addColorStop(1.0, `rgba(${cr + 20},${cg + 15},${cb + 22},0)`);
+
+    // わずかに外形を歪ませて円スタンプ感を軽減
+    const wobble = cfg.shapeWobble;
+    const points = 12;
     ctx.beginPath();
     for (let i = 0; i <= points; i++) {
       const a = (i / points) * Math.PI * 2;
-      const rr = r * (1 - wobble / 2 + Math.random() * wobble);
+      const rr = gradRadius * (1 - wobble / 2 + Math.random() * wobble);
       const px = jx + Math.cos(a) * rr;
       const py = jy + Math.sin(a) * rr;
       if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
     }
     ctx.closePath();
 
-    const grad = ctx.createRadialGradient(jx, jy, 0, jx, jy, r);
-    grad.addColorStop(0, `rgba(${cr},${cg},${cb},${centerAlpha})`);
-    grad.addColorStop(0.6, `rgba(${cr},${cg},${cb},${centerAlpha * 0.55})`);
-    grad.addColorStop(1, `rgba(${cr},${cg},${cb},0)`);
     ctx.fillStyle = grad;
     ctx.fill();
     ctx.restore();
 
-    return { drawn: true, dryGap, radius: r, opacity: centerAlpha };
+    return { drawn: true, radius: r, opacity: centerAlpha };
   }
 
   clear(w, h) {
@@ -402,9 +422,6 @@ class StrokeRenderer {
   }
 }
 
-// =========================================================
-// 7. StrokeRecorder — records normalized motion data, separate from pixels
-// =========================================================
 class StrokeRecorder {
   constructor() {
     this.strokes = [];
@@ -451,9 +468,6 @@ class StrokeRecorder {
   }
 }
 
-// =========================================================
-// 8. App — wiring everything together
-// =========================================================
 class App {
   constructor() {
     this.paperCanvas = document.getElementById('paper');
@@ -468,7 +482,7 @@ class App {
     this.ink = new InkModel(CONFIG.ink);
     this.recorder = new StrokeRecorder();
 
-    this.strokeHistory = [];   // completed StrokeData+meta, kept for future Undo
+    this.strokeHistory = [];
     this.strokeSampleCount = 0;
     this.hintDismissed = false;
     this.lastTapTime = 0;
@@ -489,10 +503,8 @@ class App {
       requestAnimationFrame(this._debugLoop.bind(this));
     }
 
-    // dev-only clear: double tap within bottom-right 80x80 zone
     this.inkCanvas.addEventListener('pointerdown', (e) => this._maybeDevClear(e));
 
-    // expose recorded motion data for developer/debug use (no visible UI)
     window.YUBISHO = {
       exportData: () => this.recorder.getData(),
       strokeCount: () => this.strokeHistory.length
@@ -504,7 +516,6 @@ class App {
     const h = window.innerHeight;
     const dpr = window.devicePixelRatio || 1;
 
-    // preserve existing ink when resizing, by redrawing scaled copy
     let snapshot = null;
     if (this.inkCanvas.width > 0) {
       snapshot = document.createElement('canvas');
@@ -568,7 +579,7 @@ class App {
     let radiusScale = 1;
     if (isStart || this.strokeSampleCount < CONFIG.render.startTaperPoints) {
       radiusScale = (this.strokeSampleCount + 1) / CONFIG.render.startTaperPoints;
-      radiusScale = clamp(radiusScale, 0.15, 1);
+      radiusScale = clamp(radiusScale, 0.2, 1);
     }
     this.strokeSampleCount++;
     this.renderer.stamp(m.x, m.y, m.radius * radiusScale, state.inkAmount, state.bleed, m.speed);
@@ -578,8 +589,8 @@ class App {
     const steps = CONFIG.render.endTaperSteps;
     let state = this.ink.update(m);
     for (let i = 0; i < steps; i++) {
-      const f = 1 - (i + 1) / steps; // fades to 0
-      const stepDist = m.radius * 0.6;
+      const f = 1 - (i + 1) / steps;
+      const stepDist = m.radius * 0.5;
       const x = m.x + Math.cos(m.direction) * stepDist * (i + 1) * 0.5;
       const y = m.y + Math.sin(m.direction) * stepDist * (i + 1) * 0.5;
       state.inkAmount *= 0.85;
@@ -621,19 +632,6 @@ bleed:${this.ink.idleBleed ? this.ink.idleBleed.toFixed(3) : '-'}`;
   }
 }
 
-// =========================================================
-// 9. small utilities
-// =========================================================
-function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
-function lerp(a, b, t) { return a + (b - a) * t; }
-function mapRange(v, inMin, inMax, outMin, outMax) {
-  const t = clamp((v - inMin) / (inMax - inMin), 0, 1);
-  return outMin + t * (outMax - outMin);
-}
-
-// =========================================================
-// 10. boot
-// =========================================================
 window.addEventListener('load', () => { new App(); });
 
 })();
