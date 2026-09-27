@@ -60,10 +60,9 @@ const CONFIG = {
     noiseAlpha: 0.02
   },
   contact: {
-    // 【修正】接触面積（指の太さ）への感度幅を拡張
     minRadius: 3.0,
-    maxRadius: 28.0,
-    smoothing: 0.40,               // 面積変化に対する反応度
+    maxRadius: 26.0,
+    smoothing: 0.35,
     fallbackRadius: 8.0,
     fallbackJitter: 0.5
   },
@@ -80,19 +79,14 @@ const CONFIG = {
     idleSpeedThreshold: 0.02
   },
   render: {
-    stampSpacing: 1.6,
-    centerAlpha: 0.88,             // 墨の核を濃く
-    shapeWobble: 0.15,             // 輪郭のわずかな歪み
+    centerAlpha: 0.88,
+    shapeWobble: 0.12,
     positionJitter: 0.2,
     speedWidthFactor: 0.25,
-    bleedRadiusFactor: 1.45,       // 【修正】墨の染み出し半径
-    bleedAlphaFactor: 0.35,
     kasureInkThreshold: 0.32,
     kasureSpeedThreshold: 0.30,
     kasureMaxProb: 0.55,
-    startTaperPoints: 5,
-    endTaperSteps: 7,
-    inkColorBase: [18, 16, 20],    // 濃い墨色
+    inkColorBase: [18, 16, 20],
     inkColorJitter: 4
   }
 };
@@ -165,14 +159,9 @@ class TouchInput {
   constructor(el, callbacks) {
     this.el = el;
     this.cb = callbacks;
-    this.activePointerId = null;
+    this.activeId = null;
 
-    // 【修正】Touch Events & Pointer Events 両対応で接触面積（radius / width/height）を正確に取得
-    el.addEventListener('touchstart', this._onTouchStart.bind(this), { passive: false });
-    el.addEventListener('touchmove', this._onTouchMove.bind(this), { passive: false });
-    el.addEventListener('touchend', this._onTouchEnd.bind(this), { passive: false });
-    el.addEventListener('touchcancel', this._onTouchEnd.bind(this), { passive: false });
-
+    // PointerEventsに一本化して描画バグを回避
     el.addEventListener('pointerdown', this._onDown.bind(this), { passive: false });
     el.addEventListener('pointermove', this._onMove.bind(this), { passive: false });
     el.addEventListener('pointerup', this._onUp.bind(this), { passive: false });
@@ -180,8 +169,7 @@ class TouchInput {
     el.addEventListener('contextmenu', (e) => e.preventDefault());
   }
 
-  _extractPointer(e) {
-    // PointerEventでの接触面抽出
+  _extract(e) {
     let size = 0;
     if (e.width && e.height) {
       size = (e.width + e.height) / 2;
@@ -192,72 +180,24 @@ class TouchInput {
     };
   }
 
-  _extractTouch(t, timeStamp) {
-    // TouchEventでの接触面（radiusX/radiusYまたはmajorRadius）抽出
-    let size = 0;
-    if (t.radiusX && t.radiusY) {
-      size = t.radiusX + t.radiusY;
-    } else if (t.touchType === 'stylus' && t.force) {
-      size = t.force * 20;
-    }
-    return {
-      x: t.clientX, y: t.clientY, t: timeStamp,
-      size: size, pressure: t.force || 0
-    };
-  }
-
-  _onTouchStart(e) {
-    if (this.activePointerId !== null) return;
-    const t = e.changedTouches[0];
-    this.activePointerId = t.identifier;
-    e.preventDefault();
-    this.cb.onStart(this._extractTouch(t, e.timeStamp));
-  }
-
-  _onTouchMove(e) {
-    for (let i = 0; i < e.changedTouches.length; i++) {
-      const t = e.changedTouches[i];
-      if (t.identifier === this.activePointerId) {
-        e.preventDefault();
-        this.cb.onMove(this._extractTouch(t, e.timeStamp));
-        break;
-      }
-    }
-  }
-
-  _onTouchEnd(e) {
-    for (let i = 0; i < e.changedTouches.length; i++) {
-      const t = e.changedTouches[i];
-      if (t.identifier === this.activePointerId) {
-        e.preventDefault();
-        this.activePointerId = null;
-        this.cb.onEnd(this._extractTouch(t, e.timeStamp));
-        break;
-      }
-    }
-  }
-
   _onDown(e) {
-    if (e.pointerType === 'touch') return; // touchイベント側で処理済み
-    if (this.activePointerId !== null) return;
-    this.activePointerId = e.pointerId;
+    if (this.activeId !== null) return;
+    this.activeId = e.pointerId;
     e.preventDefault();
-    this.cb.onStart(this._extractPointer(e));
+    this.cb.onStart(this._extract(e));
   }
 
   _onMove(e) {
-    if (e.pointerType === 'touch') return;
-    if (e.pointerId !== this.activePointerId) return;
+    if (e.pointerId !== this.activeId) return;
     e.preventDefault();
-    this.cb.onMove(this._extractPointer(e));
+    this.cb.onMove(this._extract(e));
   }
 
   _onUp(e) {
-    if (e.pointerType === 'touch') return;
-    if (e.pointerId !== this.activePointerId) return;
+    if (e.pointerId !== this.activeId) return;
     e.preventDefault();
-    this.activePointerId = null;
-    this.cb.onEnd(this._extractPointer(e));
+    this.activeId = null;
+    this.cb.onEnd(this._extract(e));
   }
 }
 
@@ -277,10 +217,8 @@ class MotionAnalyzer {
     const cfg = this.cfg;
     let vx = 0, vy = 0, speed = 0, acceleration = 0, direction = 0, dt = 16, dist = 0;
 
-    // 【修正】指の接触面積（size）に応じて半径をダイナミックに変更
     let rawRadius;
     if (sample.size && sample.size > 0) {
-      // 面積に応じた太さのマッピング
       rawRadius = mapRange(sample.size, 6, 36, cfg.minRadius, cfg.maxRadius);
     } else {
       rawRadius = cfg.fallbackRadius + (Math.random() - 0.5) * cfg.fallbackJitter;
@@ -381,25 +319,18 @@ class StrokeRenderer {
 
     ctx.save();
 
-    // 【修正】「墨感のある滲み」を作り出す3段グラデーションスタンプ
-    // 墨の芯（濃い部分）と、和紙に不規則に染み出た境界（滲み）をグラデーションストップで構築
+    // 墨の滲みグラデーション
     const gradRadius = r * (1 + bleed * 0.6);
     const grad = ctx.createRadialGradient(jx, jy, 0, jx, jy, gradRadius);
     
-    // 1. 芯（ほぼ不透明な真の墨）
     grad.addColorStop(0.0, `rgba(${cr},${cg},${cb},${centerAlpha})`);
     grad.addColorStop(0.4, `rgba(${cr},${cg},${cb},${centerAlpha * 0.92})`);
-    
-    // 2. 滲みへの遷移領域（墨が滲み始めて和紙の繊維に吸い込まれる）
     grad.addColorStop(0.7, `rgba(${cr + 10},${cg + 8},${cb + 12},${centerAlpha * 0.45})`);
     grad.addColorStop(0.88, `rgba(${cr + 15},${cg + 12},${cb + 18},${centerAlpha * 0.18})`);
-    
-    // 3. 滲みの外縁（非常に薄いぼかし）
     grad.addColorStop(1.0, `rgba(${cr + 20},${cg + 15},${cb + 22},0)`);
 
-    // わずかに外形を歪ませて円スタンプ感を軽減
     const wobble = cfg.shapeWobble;
-    const points = 12;
+    const points = 10;
     ctx.beginPath();
     for (let i = 0; i <= points; i++) {
       const a = (i / points) * Math.PI * 2;
@@ -417,54 +348,34 @@ class StrokeRenderer {
     return { drawn: true, radius: r, opacity: centerAlpha };
   }
 
+  // 払いの先端処理（丸スタンプではなく、鋭利な穂先三角形を描画）
+  drawSharpTip(m) {
+    const ctx = this.ctx;
+    const tipLength = Math.min(30, Math.max(10, m.speed * 15));
+    const angle = m.direction;
+    const r = m.radius * 0.8;
+
+    const [br, bg, bb] = CONFIG.render.inkColorBase;
+
+    const tipX = m.x + Math.cos(angle) * tipLength;
+    const tipY = m.y + Math.sin(angle) * tipLength;
+
+    const perpX = Math.cos(angle + Math.PI / 2) * r;
+    const perpY = Math.sin(angle + Math.PI / 2) * r;
+
+    ctx.save();
+    ctx.fillStyle = `rgba(${br},${bg},${bb},0.85)`;
+    ctx.beginPath();
+    ctx.moveTo(m.x + perpX, m.y + perpY);
+    ctx.lineTo(m.x - perpX, m.y - perpY);
+    ctx.lineTo(tipX, tipY);
+    ctx.closePath();
+    ctx.fill();
+    ctx.restore();
+  }
+
   clear(w, h) {
     this.ctx.clearRect(0, 0, w, h);
-  }
-}
-
-class StrokeRecorder {
-  constructor() {
-    this.strokes = [];
-    this.current = null;
-  }
-
-  startStroke() {
-    this.current = { points: [] };
-  }
-
-  addPoint(motion, w, h) {
-    if (!this.current) return;
-    this.current.points.push({
-      x: motion.x / w,
-      y: motion.y / h,
-      t: motion.t,
-      vx: motion.vx,
-      vy: motion.vy,
-      speed: motion.speed,
-      acceleration: motion.acceleration,
-      radius: motion.radius / Math.max(w, h),
-      direction: motion.direction
-    });
-  }
-
-  endStroke() {
-    if (this.current && this.current.points.length > 0) {
-      this.strokes.push(this.current);
-    }
-    this.current = null;
-  }
-
-  getData() {
-    return {
-      version: 1,
-      coordinateSystem: 'normalized',
-      strokes: this.strokes
-    };
-  }
-
-  clear() {
-    this.strokes = [];
-    this.current = null;
   }
 }
 
@@ -473,21 +384,15 @@ class App {
     this.paperCanvas = document.getElementById('paper');
     this.inkCanvas = document.getElementById('ink');
     this.hintEl = document.getElementById('hint');
-    this.debugEl = document.getElementById('debug');
 
     this.paper = new Paper(this.paperCanvas);
     this.inkCtx = this.inkCanvas.getContext('2d');
     this.renderer = new StrokeRenderer(this.inkCtx);
     this.motion = new MotionAnalyzer(CONFIG.contact);
     this.ink = new InkModel(CONFIG.ink);
-    this.recorder = new StrokeRecorder();
 
-    this.strokeHistory = [];
     this.strokeSampleCount = 0;
     this.hintDismissed = false;
-    this.lastTapTime = 0;
-    this.fps = 0;
-    this._lastFrameT = performance.now();
 
     this._resize();
     window.addEventListener('resize', () => this._resize());
@@ -497,18 +402,6 @@ class App {
       onMove: (s) => this._onMove(s),
       onEnd: (s) => this._onEnd(s)
     });
-
-    if (DEBUG) {
-      this.debugEl.style.display = 'block';
-      requestAnimationFrame(this._debugLoop.bind(this));
-    }
-
-    this.inkCanvas.addEventListener('pointerdown', (e) => this._maybeDevClear(e));
-
-    window.YUBISHO = {
-      exportData: () => this.recorder.getData(),
-      strokeCount: () => this.strokeHistory.length
-    };
   }
 
   _resize() {
@@ -551,85 +444,37 @@ class App {
     }
     this.motion.reset();
     this.ink.startStroke();
-    this.recorder.startStroke();
     this.strokeSampleCount = 0;
 
     const m = this.motion.update(sample);
-    this._depositTapered(m, true);
-    this.recorder.addPoint(m, this.w, this.h);
+    this._deposit(m);
   }
 
   _onMove(sample) {
     const m = this.motion.update(sample);
-    this._depositTapered(m, false);
-    this.recorder.addPoint(m, this.w, this.h);
-    if (DEBUG) this.lastMotion = m;
+    this._deposit(m);
   }
 
   _onEnd(sample) {
     const m = this.motion.update(sample);
-    this._depositEndTaper(m);
-    this.recorder.addPoint(m, this.w, this.h);
-    this.recorder.endStroke();
-    this.strokeHistory.push(this.recorder.strokes[this.recorder.strokes.length - 1]);
+    // 払い（指を離した際）の丸みを完全に防ぐため、先端に鋭利な三角形（抜き）を描く
+    if (m.speed > 0.15) {
+      this.renderer.drawSharpTip(m);
+    }
   }
 
-  _depositTapered(m, isStart) {
+  _deposit(m) {
     const state = this.ink.update(m);
-    let radiusScale = 1;
-    if (isStart || this.strokeSampleCount < CONFIG.render.startTaperPoints) {
-      radiusScale = (this.strokeSampleCount + 1) / CONFIG.render.startTaperPoints;
-      radiusScale = clamp(radiusScale, 0.2, 1);
-    }
     this.strokeSampleCount++;
-    this.renderer.stamp(m.x, m.y, m.radius * radiusScale, state.inkAmount, state.bleed, m.speed);
+    this.renderer.stamp(m.x, m.y, m.radius, state.inkAmount, state.bleed, m.speed);
   }
+}
 
-  _depositEndTaper(m) {
-    const steps = CONFIG.render.endTaperSteps;
-    let state = this.ink.update(m);
-    for (let i = 0; i < steps; i++) {
-      const f = 1 - (i + 1) / steps;
-      const stepDist = m.radius * 0.5;
-      const x = m.x + Math.cos(m.direction) * stepDist * (i + 1) * 0.5;
-      const y = m.y + Math.sin(m.direction) * stepDist * (i + 1) * 0.5;
-      state.inkAmount *= 0.85;
-      this.renderer.stamp(x, y, m.radius * f, state.inkAmount, state.bleed * f, m.speed + i * 0.02);
-    }
-  }
-
-  _maybeDevClear(e) {
-    const zone = 80;
-    const inZone = (e.clientX > this.w - zone) && (e.clientY > this.h - zone);
-    if (!inZone) return;
-    const now = performance.now();
-    if (now - this.lastTapTime < 400) {
-      this.renderer.clear(this.inkCanvas.width, this.inkCanvas.height);
-      this.recorder.clear();
-      this.strokeHistory = [];
-    }
-    this.lastTapTime = now;
-  }
-
-  _debugLoop() {
-    const now = performance.now();
-    const dt = now - this._lastFrameT;
-    this._lastFrameT = now;
-    this.fps = Math.round(1000 / Math.max(1, dt));
-
-    const m = this.lastMotion || {};
-    this.debugEl.textContent =
-`FPS: ${this.fps}
-canvas: ${this.w}x${this.h}  dpr:${this.dpr}
-strokes: ${this.strokeHistory.length}
-x:${(m.x||0).toFixed(1)} y:${(m.y||0).toFixed(1)}
-speed:${(m.speed||0).toFixed(3)} accel:${(m.acceleration||0).toFixed(4)}
-radius:${(m.radius||0).toFixed(2)} dir:${(m.direction||0).toFixed(2)}
-inkAmount:${this.ink.inkAmount ? this.ink.inkAmount.toFixed(3) : '-'}
-bleed:${this.ink.idleBleed ? this.ink.idleBleed.toFixed(3) : '-'}`;
-
-    requestAnimationFrame(this._debugLoop.bind(this));
-  }
+function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
+function lerp(a, b, t) { return a + (b - a) * t; }
+function mapRange(v, inMin, inMax, outMin, outMax) {
+  const t = clamp((v - inMin) / (inMax - inMin), 0, 1);
+  return outMin + t * (outMax - outMin);
 }
 
 window.addEventListener('load', () => { new App(); });
